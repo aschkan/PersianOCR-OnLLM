@@ -21,7 +21,7 @@ network.
 
 This is a sibling of the other platforms behind the **platform reverse proxy**:
 it runs as a plain-HTTP upstream on its own loopback port and the proxy
-terminates TLS and routes `persianocr.ir` to it.
+terminates TLS and routes `ocr.arsaces.ir` to it.
 
 ---
 
@@ -109,12 +109,12 @@ Add the platform to the proxy's `platforms.json` (see
 `env/persianocr.env` from the example. The orchestrator clones this repo, runs
 `persianocr-server` as a `BEHIND_PROXY` upstream on `:8084`, and serves the
 committed `persianocr-app/build` bundle. The proxy terminates TLS for
-`persianocr.ir` and forwards to it.
+`ocr.arsaces.ir` and forwards to it.
 
 ```jsonc
 { "name": "persianocr", "repo": "https://github.com/aschkan/PersianOCR-OnLLM.git",
   "serverDir": "persianocr-server", "clientDir": "persianocr-app",
-  "domain": "persianocr.ir", "appPort": 8084, "devPort": 5004,
+  "domain": "ocr.arsaces.ir", "appPort": 8084, "devPort": 5004,
   "envFile": "env/persianocr.env" }
 ```
 
