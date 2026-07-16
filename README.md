@@ -113,6 +113,7 @@ committed `persianocr-app/build` bundle. The proxy terminates TLS for
 
 ```jsonc
 { "name": "persianocr", "repo": "https://github.com/aschkan/PersianOCR-OnLLM.git",
+  "branch": "claude/persian-receipt-ocr-7dh901",   // → "main" once this is merged
   "serverDir": "persianocr-server", "clientDir": "persianocr-app",
   "domain": "ocr.arsaces.ir", "appPort": 8084, "devPort": 5004,
   "envFile": "env/persianocr.env" }
