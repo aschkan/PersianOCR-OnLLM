@@ -26,8 +26,35 @@ const TIMEOUT_MS  = Number(process.env.OCR_TIMEOUT_MS) || 180000;
 const MAX_TOKENS  = Number(process.env.OCR_MAX_TOKENS) || 4096;
 const TEMPERATURE = process.env.OCR_TEMPERATURE !== undefined ? Number(process.env.OCR_TEMPERATURE) : 0.1;
 
+// How to encode the image in `image_url.url`. Different LM Studio / llama.cpp
+// builds disagree: some want a full data-URL, others reject it and demand the
+// RAW base64 ("'url' field must be a base64 encoded image."). 'auto' tries the
+// data-URL first, falls back to raw base64 on that error, and remembers whatever
+// worked. Force one with OCR_IMAGE_MODE=dataurl|base64.
+const IMAGE_MODES = ['dataurl', 'base64'];
+let _imageMode = IMAGE_MODES.includes(process.env.OCR_IMAGE_MODE) ? process.env.OCR_IMAGE_MODE : 'auto';
+
 function getConfig() {
-  return { url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS, temperature: TEMPERATURE };
+  return { url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS, temperature: TEMPERATURE, imageMode: _imageMode };
+}
+
+// Normalize whatever the caller passed (a {buffer,mime} or a data-URL string)
+// into { b64, mime }.
+function toImage(image) {
+  if (image && image.buffer) return { b64: Buffer.from(image.buffer).toString('base64'), mime: image.mime || 'image/jpeg' };
+  const s = String(image || '');
+  const m = s.match(/^data:([^;]+);base64,([\s\S]*)$/);
+  if (m) return { b64: m[2], mime: m[1] };
+  return { b64: s.replace(/^data:[^,]*,/, ''), mime: 'image/jpeg' }; // assume already base64
+}
+
+function imageUrlFor(b64, mime, mode) {
+  return mode === 'base64' ? b64 : `data:${mime};base64,${b64}`;
+}
+
+// A 400 that means "you encoded the image wrong" — trigger the mode fallback.
+function isImageFormatError(msg) {
+  return /base64 encoded image|must be a base64|'url' field|image[_ ]?url/i.test(String(msg || ''));
 }
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
@@ -135,33 +162,62 @@ function headers(len) {
 }
 
 /** Build the multimodal message array (text instruction + image). */
-function visionMessages(instruction, imageDataUrl, userNote) {
+function visionMessages(instruction, imageUrl, userNote) {
   const content = [{ type: 'text', text: userNote ? `${instruction}\n\nExtra context from the user: ${userNote}` : instruction }];
-  content.push({ type: 'image_url', image_url: { url: imageDataUrl } });
+  content.push({ type: 'image_url', image_url: { url: imageUrl } });
   return [{ role: 'user', content }];
+}
+
+/**
+ * Core vision call with image-encoding fallback. Tries the current image mode;
+ * on an "image encoded wrong" 400 it flips the mode once and retries, caching the
+ * mode that works. For streaming, the 400 arrives before any token so the retry
+ * is safe.
+ *   opts: { instruction, image:{buffer,mime}|dataUrl, note, temperature, maxTokens, onChunk }
+ */
+async function visionCall({ instruction, image, note = '', temperature = TEMPERATURE, maxTokens = MAX_TOKENS, onChunk }) {
+  const { b64, mime } = toImage(image);
+  const stream = typeof onChunk === 'function';
+  const url = `${AI_URL}/chat/completions`;
+  const modes = _imageMode === 'auto' ? IMAGE_MODES.slice() : [_imageMode];
+
+  let lastErr;
+  for (let i = 0; i < modes.length; i++) {
+    const mode = modes[i];
+    const messages = visionMessages(instruction, imageUrlFor(b64, mime, mode), note);
+    const payload = JSON.stringify({ model: AI_MODEL, messages, max_tokens: maxTokens, temperature, stream });
+    try {
+      let out;
+      if (stream) {
+        const h = headers(Buffer.byteLength(payload)); h['Accept'] = 'text/event-stream';
+        out = await postStream(url, h, payload, onChunk, TIMEOUT_MS);
+      } else {
+        const { status, body } = await post(url, headers(Buffer.byteLength(payload)), payload, TIMEOUT_MS);
+        if (status !== 200) throw new Error(`vision model HTTP ${status}: ${body.slice(0, 200)}`);
+        out = JSON.parse(body)?.choices?.[0]?.message?.content?.trim() || '';
+      }
+      _imageMode = mode; // remember the encoding that worked
+      return out;
+    } catch (e) {
+      lastErr = e;
+      // Only fall through to the next encoding for a format error, and only if
+      // there IS a next one to try.
+      if (!(isImageFormatError(e.message) && i < modes.length - 1)) throw e;
+    }
+  }
+  throw lastErr;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
  * Transcribe a receipt image to faithful Markdown.
- *   transcribe(imageDataUrl, { note, onChunk })
- * If onChunk is provided the response is streamed (tokens delivered live) and the
- * full text is returned when done; otherwise a single blocking call is made.
+ *   transcribe(image, { note, onChunk })   image = {buffer,mime} or a data-URL
+ * If onChunk is provided the response is streamed and the full text is returned
+ * when done; otherwise a single blocking call is made.
  */
-async function transcribe(imageDataUrl, { note = '', onChunk } = {}) {
-  const messages = visionMessages(TRANSCRIBE_PROMPT, imageDataUrl, note);
-  const stream = typeof onChunk === 'function';
-  const payload = JSON.stringify({ model: AI_MODEL, messages, max_tokens: MAX_TOKENS, temperature: TEMPERATURE, stream });
-  const url = `${AI_URL}/chat/completions`;
-
-  if (stream) {
-    const h = headers(Buffer.byteLength(payload)); h['Accept'] = 'text/event-stream';
-    return postStream(url, h, payload, onChunk, TIMEOUT_MS);
-  }
-  const { status, body } = await post(url, headers(Buffer.byteLength(payload)), payload, TIMEOUT_MS);
-  if (status !== 200) throw new Error(`vision model HTTP ${status}: ${body.slice(0, 200)}`);
-  return JSON.parse(body)?.choices?.[0]?.message?.content?.trim() || '';
+async function transcribe(image, { note = '', onChunk } = {}) {
+  return visionCall({ instruction: TRANSCRIBE_PROMPT, image, note, onChunk });
 }
 
 /**
@@ -169,12 +225,8 @@ async function transcribe(imageDataUrl, { note = '', onChunk } = {}) {
  * Returns { data, raw } — `data` is the parsed object (or null if the model
  * didn't return valid JSON), `raw` is the model's raw string for debugging.
  */
-async function extractStructured(imageDataUrl, { note = '' } = {}) {
-  const messages = visionMessages(STRUCTURE_PROMPT, imageDataUrl, note);
-  const payload = JSON.stringify({ model: AI_MODEL, messages, max_tokens: MAX_TOKENS, temperature: 0, stream: false });
-  const { status, body } = await post(`${AI_URL}/chat/completions`, headers(Buffer.byteLength(payload)), payload, TIMEOUT_MS);
-  if (status !== 200) throw new Error(`vision model HTTP ${status}: ${body.slice(0, 200)}`);
-  const raw = JSON.parse(body)?.choices?.[0]?.message?.content?.trim() || '';
+async function extractStructured(image, { note = '' } = {}) {
+  const raw = await visionCall({ instruction: STRUCTURE_PROMPT, image, note, temperature: 0 });
   return { data: parseJsonLoose(raw), raw };
 }
 

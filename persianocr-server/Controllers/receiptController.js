@@ -8,7 +8,7 @@
 const mongoose = require('mongoose');
 const Receipt = require('../Models/Receipt');
 const ocr = require('../Services/ocrService');
-const { saveImage, readImage, removeImage, imagePath, dataUrl } = require('../config/uploads');
+const { saveImage, readImage, removeImage, imagePath } = require('../config/uploads');
 const { AppError } = require('../Middleware/errorHandler');
 
 const fs = require('fs');
@@ -57,8 +57,8 @@ exports.createStream = async (req, res, next) => {
 
   const started = Date.now();
   try {
-    const url = dataUrl(req.file.buffer, req.file.mimetype);
-    const full = await ocr.transcribe(url, { note, onChunk: (t) => res.write(t) });
+    const image = { buffer: req.file.buffer, mime: req.file.mimetype };
+    const full = await ocr.transcribe(image, { note, onChunk: (t) => res.write(t) });
     doc.text = full;
     doc.status = 'done';
     doc.durationMs = Date.now() - started;
@@ -97,8 +97,7 @@ exports.create = async (req, res, next) => {
 
   const started = Date.now();
   try {
-    const url = dataUrl(req.file.buffer, req.file.mimetype);
-    doc.text = await ocr.transcribe(url, { note });
+    doc.text = await ocr.transcribe({ buffer: req.file.buffer, mime: req.file.mimetype }, { note });
     doc.status = 'done';
     doc.durationMs = Date.now() - started;
     await doc.save();
@@ -161,7 +160,7 @@ exports.structure = async (req, res, next) => {
     const buf = readImage(doc.imageFile);
     if (!buf) return next(new AppError('Original image is no longer available', 410));
 
-    const { data, raw } = await ocr.extractStructured(dataUrl(buf, doc.mime), { note: doc.note });
+    const { data, raw } = await ocr.extractStructured({ buffer: buf, mime: doc.mime }, { note: doc.note });
     if (!data) return next(new AppError('Model did not return valid JSON', 502));
     doc.structured = data;
     await doc.save();
@@ -178,7 +177,7 @@ exports.reprocess = async (req, res, next) => {
     if (!buf) return next(new AppError('Original image is no longer available', 410));
 
     const started = Date.now();
-    doc.text = await ocr.transcribe(dataUrl(buf, doc.mime), { note: doc.note });
+    doc.text = await ocr.transcribe({ buffer: buf, mime: doc.mime }, { note: doc.note });
     doc.status = 'done';
     doc.error = '';
     doc.durationMs = Date.now() - started;
