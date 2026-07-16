@@ -105,10 +105,10 @@ Point `OCR_AI_URL` at that machine, e.g. `http://192.168.11.165:1234/v1`.
 ## Production (behind the platform reverse proxy)
 
 Add the platform to the proxy's `platforms.json` (see
-`platform-reverse-proxy/platforms.example.json`) and create
-`env/persianocr.env` from the example. The orchestrator clones this repo, runs
-`persianocr-server` as a `BEHIND_PROXY` upstream on `:8084`, and serves the
-committed `persianocr-app/build` bundle. The proxy terminates TLS for
+`platform-reverse-proxy/platforms.example.json`). Its whole environment lives
+**inline** in that entry — no separate env file needed. The orchestrator clones
+this repo, runs `persianocr-server` as a `BEHIND_PROXY` upstream on `:8084`, and
+serves the committed `persianocr-app/build` bundle. The proxy terminates TLS for
 `ocr.arsaces.ir` and forwards to it.
 
 ```jsonc
@@ -116,7 +116,14 @@ committed `persianocr-app/build` bundle. The proxy terminates TLS for
   "branch": "claude/persian-receipt-ocr-7dh901",   // → "main" once this is merged
   "serverDir": "persianocr-server", "clientDir": "persianocr-app",
   "domain": "ocr.arsaces.ir", "appPort": 8084, "devPort": 5004,
-  "envFile": "env/persianocr.env" }
+  "certPath": "/etc/letsencrypt/live/ocr.arsaces.ir/fullchain.pem",
+  "keyPath":  "/etc/letsencrypt/live/ocr.arsaces.ir/privkey.pem",
+  "env": {
+    "MONGO_URI": "mongodb://127.0.0.1:27017/persianocr",
+    "OCR_AI_URL": "http://192.168.11.165:1234/v1",
+    "OCR_AI_MODEL": "gemma-3-4b-it",
+    "CORS_ORIGINS": "https://ocr.arsaces.ir"
+  } }
 ```
 
 ## Notes
