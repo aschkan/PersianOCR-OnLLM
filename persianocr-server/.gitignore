@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+*.log
+npm-debug.log*
+
+# Uploaded receipt images are user data — never commit them. Keep the folder.
+uploads/*
+!uploads/.gitkeep
+
+.DS_Store

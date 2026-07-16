@@ -1,0 +1,14 @@
+{
+  "short_name": "Persian OCR",
+  "name": "PersianOCR-OnLLM — Persian Receipt OCR",
+  "icons": [
+    { "src": "icon.svg", "type": "image/svg+xml", "sizes": "any" }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#0a0c14",
+  "background_color": "#0a0c14",
+  "lang": "fa",
+  "dir": "rtl"
+}

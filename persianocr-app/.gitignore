@@ -1,0 +1,13 @@
+# Dependencies — never committed
+/node_modules
+
+# Local env / logs
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+npm-debug.log*
+
+# NOTE: build/ IS committed — Express serves the built bundle in production.
+# The Tailwind CLI generates index.css from styles.css (see package.json).
+src/index.css
