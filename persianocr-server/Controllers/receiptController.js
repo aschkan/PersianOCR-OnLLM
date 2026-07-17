@@ -234,8 +234,12 @@ exports.exportOne = async (req, res, next) => {
 function send(res, filename, type, body) {
   res.setHeader('Content-Type', type);
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  // UTF-8 BOM so Excel opens Persian CSV correctly.
-  res.send(type.startsWith('text/csv') ? '﻿' + body : body);
+  // Prepend a UTF-8 BOM to text downloads (txt/md/csv). Once saved to disk the
+  // HTTP charset is lost, so editors/viewers fall back to the system codepage and
+  // render Persian as mojibake (Ø¯Ø±ÛŒ…). The BOM makes them detect UTF-8. JSON is
+  // left as-is — a BOM breaks strict JSON parsers and browsers already show it.
+  const isText = /^text\//.test(type);
+  res.send(isText ? '\uFEFF' + body : body);
 }
 
 function itemsToCsv(structured) {
