@@ -34,8 +34,15 @@ const TEMPERATURE = process.env.OCR_TEMPERATURE !== undefined ? Number(process.e
 const IMAGE_MODES = ['dataurl', 'base64'];
 let _imageMode = IMAGE_MODES.includes(process.env.OCR_IMAGE_MODE) ? process.env.OCR_IMAGE_MODE : 'auto';
 
+// Multi-pass "self-consistency" OCR. Small models (e.g. gemma-3-4b) misread the
+// odd digit or drop a trailing zero. Running the transcription a few times with a
+// little temperature and then reconciling the attempts against the image catches
+// most of those. 1 = off (single pass, current behaviour).
+const OCR_PASSES = Math.max(1, Math.min(6, Number(process.env.OCR_PASSES) || 1));
+const OCR_DRAFT_TEMP = process.env.OCR_DRAFT_TEMP !== undefined ? Number(process.env.OCR_DRAFT_TEMP) : 0.35;
+
 function getConfig() {
-  return { url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS, temperature: TEMPERATURE, imageMode: _imageMode };
+  return { url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS, temperature: TEMPERATURE, imageMode: _imageMode, passes: OCR_PASSES };
 }
 
 // Normalize whatever the caller passed (a {buffer,mime} or a data-URL string)
@@ -69,9 +76,26 @@ const TRANSCRIBE_PROMPT = [
   '- Do NOT translate. Keep Persian text in Persian and keep the original digits (Persian ۰-۹ or English) exactly as written.',
   '- Preserve the reading order and line breaks of the document (Persian reads right-to-left).',
   '- Render any table (items, quantities, prices, totals) as a GitHub-flavoured Markdown table with the original column headers.',
+  '- NUMBERS ARE CRITICAL. Persian prices (ریال/تومان) are usually large — thousands or millions. Read every digit carefully and copy the FULL number; never drop trailing zeros (e.g. keep ۱٬۲۰۰٬۰۰۰, do NOT shorten it to ۱۲۰۰). Keep the thousands separators exactly as printed.',
   '- Keep every number, unit (ریال/تومان), date, phone number and code faithful — do not round, reformat or invent values.',
   '- For unclear or illegible handwriting, transcribe your best guess and mark it with «؟» right after the uncertain part.',
   '- If part of the image is empty or not text, simply skip it.',
+].join('\n');
+
+// Reconciliation / proof-reading pass. Given several independent OCR attempts of
+// the same image, produce one corrected transcription — this is where dropped
+// zeros and misread digits get caught by cross-checking the attempts vs. pixels.
+const RECONCILE_PROMPT = [
+  'You are a meticulous proof-reader for Persian (Farsi) receipt OCR.',
+  'Below are several INDEPENDENT OCR attempts at the SAME receipt (the image is attached too).',
+  'Produce ONE final, corrected transcription that is more accurate than any single attempt.',
+  '',
+  'Rules:',
+  '- Cross-check the attempts against the image. Where they disagree, pick the reading the image supports.',
+  '- NUMBERS ARE THE PRIORITY. Persian prices (ریال/تومان) are large — thousands/millions. Verify EVERY digit against the image and keep the COMPLETE number; never drop trailing zeros (keep ۱٬۲۰۰٬۰۰۰, not ۱۲۰۰). If one attempt has more zeros than another and the image agrees, keep the longer one. Preserve thousands separators.',
+  '- Keep the original digits (Persian ۰-۹ or English) and Persian text exactly; do not translate, round, or summarise.',
+  '- Render tables as GitHub-flavoured Markdown with the original headers.',
+  '- Output only the final transcription — no commentary, no notes, no code fences.',
 ].join('\n');
 
 // Structured extraction → strict JSON. Kept separate so each call is one focused
@@ -221,6 +245,36 @@ async function transcribe(image, { note = '', onChunk } = {}) {
 }
 
 /**
+ * Higher-accuracy transcription: run several independent passes, then reconcile
+ * them against the image in a final proof-reading pass (streamed if onChunk).
+ * `passes` defaults to OCR_PASSES; 1 falls straight through to transcribe().
+ * This is where dropped trailing zeros / misread digits get corrected.
+ *   transcribeRefined(image, { note, passes, onChunk, onStatus })
+ */
+async function transcribeRefined(image, { note = '', passes = OCR_PASSES, onChunk, onStatus } = {}) {
+  passes = Math.max(1, Math.min(6, Number(passes) || 1));
+  if (passes <= 1) return transcribe(image, { note, onChunk });
+
+  // 1) draft passes (non-streaming, a little temperature for useful diversity).
+  const drafts = [];
+  for (let i = 0; i < passes; i++) {
+    if (onStatus) onStatus({ phase: 'draft', pass: i + 1, of: passes });
+    try {
+      const d = await visionCall({ instruction: TRANSCRIBE_PROMPT, image, note, temperature: OCR_DRAFT_TEMP });
+      if (d && d.trim()) drafts.push(d.trim());
+    } catch (e) { /* a single failed pass shouldn't sink the batch */ }
+  }
+  if (!drafts.length) throw new Error('all OCR passes failed');
+  if (drafts.length === 1) { if (onChunk) onChunk(drafts[0]); return drafts[0]; }
+
+  // 2) reconciliation pass — image + all drafts, deterministic, streamed out.
+  if (onStatus) onStatus({ phase: 'reconcile', of: passes });
+  const attempts = drafts.map((d, i) => `### Attempt ${i + 1}\n${d}`).join('\n\n');
+  const instruction = `${RECONCILE_PROMPT}\n\n--- OCR ATTEMPTS ---\n${attempts}`;
+  return visionCall({ instruction, image, note, temperature: 0, onChunk });
+}
+
+/**
  * Extract a structured JSON invoice object from a receipt image.
  * Returns { data, raw } — `data` is the parsed object (or null if the model
  * didn't return valid JSON), `raw` is the model's raw string for debugging.
@@ -253,4 +307,4 @@ async function testConnection() {
   }
 }
 
-module.exports = { transcribe, extractStructured, testConnection, getConfig };
+module.exports = { transcribe, transcribeRefined, extractStructured, testConnection, getConfig };

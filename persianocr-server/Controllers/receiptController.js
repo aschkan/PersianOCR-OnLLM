@@ -58,7 +58,7 @@ exports.createStream = async (req, res, next) => {
   const started = Date.now();
   try {
     const image = { buffer: req.file.buffer, mime: req.file.mimetype };
-    const full = await ocr.transcribe(image, { note, onChunk: (t) => res.write(t) });
+    const full = await ocr.transcribeRefined(image, { note, onChunk: (t) => res.write(t) });
     doc.text = full;
     doc.status = 'done';
     doc.durationMs = Date.now() - started;
@@ -97,7 +97,7 @@ exports.create = async (req, res, next) => {
 
   const started = Date.now();
   try {
-    doc.text = await ocr.transcribe({ buffer: req.file.buffer, mime: req.file.mimetype }, { note });
+    doc.text = await ocr.transcribeRefined({ buffer: req.file.buffer, mime: req.file.mimetype }, { note });
     doc.status = 'done';
     doc.durationMs = Date.now() - started;
     await doc.save();
@@ -177,7 +177,7 @@ exports.reprocess = async (req, res, next) => {
     if (!buf) return next(new AppError('Original image is no longer available', 410));
 
     const started = Date.now();
-    doc.text = await ocr.transcribe({ buffer: buf, mime: doc.mime }, { note: doc.note });
+    doc.text = await ocr.transcribeRefined({ buffer: buf, mime: doc.mime }, { note: doc.note });
     doc.status = 'done';
     doc.error = '';
     doc.durationMs = Date.now() - started;
