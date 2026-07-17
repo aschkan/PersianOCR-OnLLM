@@ -163,19 +163,26 @@ if (require.main === module) {
   const listenPort = BEHIND_PROXY ? APP_PORT : PORT;
 
   const server = httpMod.createServer(app);
-  let retried = false;
+  let attempts = 0;
+  const MAX_ATTEMPTS = 4;
 
   // If the port is stuck (a stale instance / crash-restart left it bound), kill
-  // the holder and retry once instead of dying with EADDRINUSE.
+  // the holder and retry — a few times, with backoff, before giving up so the
+  // orchestrator can respawn us.
   server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE' && !retried) {
-      retried = true;
-      console.warn(`⚠️  ${err.code}: port ${listenPort} is busy — reclaiming and retrying…`);
-      reclaimPort(listenPort);
-      setTimeout(() => { try { server.listen(listenPort, HOST); } catch (e) { console.error(e); process.exit(1); } }, 800);
+    if (err.code === 'EADDRINUSE' && attempts < MAX_ATTEMPTS) {
+      attempts += 1;
+      const killed = reclaimPort(listenPort);
+      console.warn(`⚠️  ${err.code}: port ${listenPort} busy (attempt ${attempts}/${MAX_ATTEMPTS})` +
+        (killed.length ? ` — killed PID ${killed.join(', ')}, retrying…` : ' — could not find/kill the holder, retrying…'));
+      setTimeout(() => { try { server.listen(listenPort, HOST); } catch (e) { console.error(e); process.exit(1); } }, 400 * attempts);
       return;
     }
-    console.error('❌  server error:', err.message);
+    if (err.code === 'EADDRINUSE') {
+      console.error(`❌  port ${listenPort} is still held after ${MAX_ATTEMPTS} attempts — another persianocr instance is running that this process can't kill (different user? run as root or stop it manually).`);
+    } else {
+      console.error('❌  server error:', err.message);
+    }
     process.exit(1);
   });
 
