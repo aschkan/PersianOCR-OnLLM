@@ -160,11 +160,16 @@ exports.structure = async (req, res, next) => {
     const buf = readImage(doc.imageFile);
     if (!buf) return next(new AppError('Original image is no longer available', 410));
 
-    const { data, raw } = await ocr.extractStructured({ buffer: buf, mime: doc.mime }, { note: doc.note });
+    // The stored transcription grounds the verifier's amount-in-words /
+    // currency / identifier checks (the pipeline works without it too).
+    const { data, raw, verification } = await ocr.extractStructured(
+      { buffer: buf, mime: doc.mime },
+      { note: doc.note, transcription: doc.text }
+    );
     if (!data) return next(new AppError('Model did not return valid JSON', 502));
     doc.structured = data;
     await doc.save();
-    res.json({ success: true, structured: doc.structured, raw });
+    res.json({ success: true, structured: doc.structured, verification, raw });
   } catch (err) { next(new AppError(`Extraction failed: ${err.message || err}`, 502)); }
 };
 

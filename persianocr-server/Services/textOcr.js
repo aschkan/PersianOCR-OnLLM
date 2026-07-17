@@ -90,8 +90,39 @@ async function ocrText(buffer, mime) {
   }
 }
 
+/**
+ * OCR with word bounding boxes (Tesseract TSV output) on the ORIGINAL image —
+ * no preprocessing, so the coordinates map straight onto the uploaded pixels.
+ * Returns [{ text, left, top, width, height, conf }] or [] when unavailable.
+ * Used by the adaptive pipeline to locate the amount region for a zoomed
+ * re-read; purely best-effort like everything else in this module.
+ */
+async function ocrWords(buffer, mime) {
+  if (!available() || !buffer || !buffer.length) return [];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocr-tsv-'));
+  const inPath = path.join(dir, 'in' + (/png/i.test(mime || '') ? '.png' : '.jpg'));
+  try {
+    fs.writeFileSync(inPath, buffer);
+    const r = await run(TESS_BIN, [inPath, 'stdout', '-l', LANG, '--psm', PSM, 'tsv'], TIMEOUT_MS);
+    if (r.code !== 0) return [];
+    const words = [];
+    for (const line of r.out.toString('utf8').split('\n').slice(1)) {
+      const c = line.split('\t');
+      if (c.length < 12 || c[0] !== '5') continue; // level 5 = word
+      const text = (c[11] || '').trim();
+      if (!text) continue;
+      words.push({ text, left: +c[6], top: +c[7], width: +c[8], height: +c[9], conf: +c[10] });
+    }
+    return words;
+  } catch {
+    return [];
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 function status() {
   return { available: available(), lang: LANG, preprocess: PREPROCESS, bin: TESS_BIN };
 }
 
-module.exports = { available, ocrText, status };
+module.exports = { available, ocrText, ocrWords, status };

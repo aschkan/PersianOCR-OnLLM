@@ -146,6 +146,39 @@ Small vision models misread dense receipts — especially large Persian amounts
 Both combine, and both are just env settings (`OCR_TESSERACT`, `OCR_PASSES`). For
 raw recognition of unusual fonts, also try a bigger model (`OCR_AI_MODEL`).
 
+### Adaptive self-verifying extraction
+
+Structured extraction (`POST /api/receipts/:id/structure`) no longer trusts the
+model's JSON. Per image, the pipeline:
+
+1. **Probes quality** (`identify`: resolution/contrast) and picks a plan.
+   *Clean* receipts get one clean-room pass — no Tesseract text in the prompt,
+   which is what used to tempt the model into using cheque/reference numbers as
+   prices. *Poor* images get ImageMagick enhancement, reference-OCR grounding
+   and extra passes.
+2. **Verifies deterministically** (`Services/receiptVerify.js` +
+   `Services/persianNumbers.js`, a Persian number-words parser):
+   - the amount in words («به حروف …») converted to digits **is the source of
+     truth** for the total (catches added/dropped zeros);
+   - currency comes **only** from the printed unit (`ریال`→IRR, `تومان`→IRT);
+   - `qty×unitPrice=line` and lines (−discount+tax) must sum to the total;
+   - cheque/account/reference/terminal/card/phone numbers and dates must never
+     appear in a money field.
+3. **Repairs**: failed checks are fed back to the model verbatim for up to
+   `OCR_FIX_ROUNDS` re-reads, optionally with a zoomed crop of the مبلغ region
+   (Tesseract word boxes + ImageMagick) as extra evidence.
+4. **Fixes deterministically** whatever the model keeps getting wrong (words
+   win; identifiers evicted; unit-derived currency), nulls what can't be
+   trusted, and returns `verification`: the checks that passed, a confidence
+   score and plain-language warnings (stored on the receipt and in the API
+   response).
+
+Tune with `OCR_VERIFY`, `OCR_ADAPTIVE`, `OCR_FIX_ROUNDS`, `OCR_REF_MODE`,
+`OCR_CROP_RETRY`, `OCR_ENHANCE_FOR_LLM`, `OCR_QUALITY_MIN_DIM`,
+`OCR_QUALITY_MIN_STDDEV` (see `.env.example`). Every step degrades gracefully
+when a tool is missing. The accuracy logic is pure and tested: `npm test` in
+`persianocr-server/`.
+
 ## Notes
 
 - **No cloud.** Images go only to your LM Studio box (and the local Tesseract);

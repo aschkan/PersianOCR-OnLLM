@@ -18,6 +18,8 @@
 const http = require('http');
 const https = require('https');
 const textOcr = require('./textOcr');   // optional Tesseract grounding (digits)
+const imageQuality = require('./imageQuality');           // per-image quality probe + enhance/crop
+const { createPipeline } = require('./extractionPipeline'); // adaptive self-verifying extraction
 
 // ── Config (env → built-in defaults) ──────────────────────────────────────────
 const AI_URL      = (process.env.OCR_AI_URL || 'http://localhost:1234/v1').replace(/\/$/, '');
@@ -63,7 +65,11 @@ const OCR_PASSES = Math.max(1, Math.min(6, Number(process.env.OCR_PASSES) || 1))
 const OCR_DRAFT_TEMP = process.env.OCR_DRAFT_TEMP !== undefined ? Number(process.env.OCR_DRAFT_TEMP) : 0.35;
 
 function getConfig() {
-  return { url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS, temperature: TEMPERATURE, imageMode: _fmtId || 'auto', passes: OCR_PASSES, tesseract: textOcr.status() };
+  return {
+    url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS,
+    temperature: TEMPERATURE, imageMode: _fmtId || 'auto', passes: OCR_PASSES,
+    tesseract: textOcr.status(), imageTools: imageQuality.status(), pipeline: pipeline.config,
+  };
 }
 
 // Run the reference OCR engine (Tesseract) on the image; '' if unavailable.
@@ -175,8 +181,14 @@ const STRUCTURE_PROMPT = [
   '  "tax": number|null,',
   '  "total": number|null,           // MUST equal amountInWords when that is present',
   '  "currency": string|null,        // "IRR" (ریال) or "IRT" (تومان) — from the printed unit',
-  '  "paymentMethod": string|null',
+  '  "paymentMethod": string|null,',
+  '  "identifiers": {                // every labelled NON-money number goes here, never in amounts',
+  '    "cheque": string|null, "account": string|null, "reference": string|null,',
+  '    "terminal": string|null, "card": string|null, "phone": string|null',
+  '  }',
   '}',
+  '',
+  'Before answering, SELF-CHECK: (a) count the digits of total and compare with the amount-in-words value; (b) confirm the currency is the printed unit; (c) confirm every number you placed in a money field sits in a مبلغ/ریال/تومان column on the image; (d) confirm cheque/account/reference/terminal/card numbers are ONLY inside "identifiers". Fix any failure by re-reading the image before you answer.',
 ].join('\n');
 
 // ── Low-level HTTP (mirrors aiService: raw core modules, no fetch dep) ─────────
@@ -293,6 +305,17 @@ async function visionCall({ instruction, image, note = '', temperature = TEMPERA
   throw lastErr;
 }
 
+// ── Adaptive extraction pipeline (deps injected; see extractionPipeline.js) ───
+const pipeline = createPipeline({
+  visionCall,
+  structurePrompt: STRUCTURE_PROMPT,
+  withReference,
+  parseJsonLoose,
+  referenceOcr,
+  textOcr,
+  quality: imageQuality,
+});
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -302,7 +325,7 @@ async function visionCall({ instruction, image, note = '', temperature = TEMPERA
  * when done; otherwise a single blocking call is made.
  */
 async function transcribe(image, { note = '', onChunk, ref } = {}) {
-  if (ref === undefined) ref = await referenceOcr(image);
+  if (ref === undefined) ref = pipeline.config.refMode === 'never' ? '' : await referenceOcr(image);
   return visionCall({ instruction: withReference(TRANSCRIBE_PROMPT, ref), image, note, onChunk });
 }
 
@@ -315,8 +338,25 @@ async function transcribe(image, { note = '', onChunk, ref } = {}) {
  */
 async function transcribeRefined(image, { note = '', passes = OCR_PASSES, onChunk, onStatus } = {}) {
   passes = Math.max(1, Math.min(6, Number(passes) || 1));
+
+  // ── Adaptive plan (fixes the clean-receipt regression) ──────────────────────
+  // Probe the image quality first. CLEAN receipts take the single-pass,
+  // clean-room path that always worked best for them: no Tesseract text in the
+  // prompt (its unlabelled ID numbers are what tempted the model to treat them
+  // as prices) and no redundant draft passes. POOR images get the full arsenal:
+  // reference-OCR grounding + multi-pass reconciliation. OCR_ADAPTIVE=false
+  // restores the previous fixed behaviour; OCR_REF_MODE=always|never overrides
+  // the grounding decision either way.
+  let probe = { quality: 'unknown' };
+  if (pipeline.config.adaptive && image && image.buffer) {
+    try { probe = await imageQuality.assess(Buffer.from(image.buffer), image.mime); } catch { /* keep unknown */ }
+  }
+  if (pipeline.config.adaptive && probe.quality === 'clean') passes = 1;
+  const useRef = pipeline.config.refMode === 'always' ||
+    (pipeline.config.refMode === 'auto' && (!pipeline.config.adaptive || probe.quality !== 'clean'));
+
   // Reference OCR once, reused across every pass (grounds digits everywhere).
-  const ref = await referenceOcr(image);
+  const ref = useRef ? await referenceOcr(image) : '';
   if (passes <= 1) return transcribe(image, { note, onChunk, ref });
 
   const draftInstruction = withReference(TRANSCRIBE_PROMPT, ref);
@@ -340,14 +380,17 @@ async function transcribeRefined(image, { note = '', passes = OCR_PASSES, onChun
 }
 
 /**
- * Extract a structured JSON invoice object from a receipt image.
- * Returns { data, raw } — `data` is the parsed object (or null if the model
- * didn't return valid JSON), `raw` is the model's raw string for debugging.
+ * Extract a structured JSON invoice object from a receipt image, through the
+ * adaptive self-verifying pipeline (quality probe → extraction → deterministic
+ * checks → targeted repair rounds → words-win fixes).
+ * Returns { data, raw, verification } — `data` is the verified object (null if
+ * the model never returned valid JSON) with `data.verification` carrying the
+ * checks, confidence and warnings; `raw` is the model's last raw string.
+ * Pass `transcription` (the receipt's OCR text, if already available) so the
+ * verifier can ground the amount-in-words / currency / identifier checks.
  */
-async function extractStructured(image, { note = '' } = {}) {
-  const ref = await referenceOcr(image);
-  const raw = await visionCall({ instruction: withReference(STRUCTURE_PROMPT, ref), image, note, temperature: 0 });
-  return { data: parseJsonLoose(raw), raw };
+async function extractStructured(image, { note = '', transcription = '', onStatus } = {}) {
+  return pipeline.extract(image, { note, transcription, onStatus });
 }
 
 /** Tolerant JSON parse: strips code fences and grabs the outermost {...}. */
