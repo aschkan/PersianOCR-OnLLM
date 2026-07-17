@@ -159,8 +159,29 @@ function banner(port) {
 
 if (require.main === module) {
   const httpMod = require('http');
+  const { reclaimPort } = require('./config/ports');
   const listenPort = BEHIND_PROXY ? APP_PORT : PORT;
-  httpMod.createServer(app).listen(listenPort, HOST, () => {
+
+  const server = httpMod.createServer(app);
+  let retried = false;
+
+  // If the port is stuck (a stale instance / crash-restart left it bound), kill
+  // the holder and retry once instead of dying with EADDRINUSE.
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE' && !retried) {
+      retried = true;
+      console.warn(`⚠️  ${err.code}: port ${listenPort} is busy — reclaiming and retrying…`);
+      reclaimPort(listenPort);
+      setTimeout(() => { try { server.listen(listenPort, HOST); } catch (e) { console.error(e); process.exit(1); } }, 800);
+      return;
+    }
+    console.error('❌  server error:', err.message);
+    process.exit(1);
+  });
+
+  // Proactively free the port before the first bind, too.
+  reclaimPort(listenPort);
+  server.listen(listenPort, HOST, () => {
     banner(listenPort);
     if (BEHIND_PROXY) console.log('    ↑ BEHIND_PROXY: a reverse proxy terminates TLS and owns :80/:443\n');
   });
