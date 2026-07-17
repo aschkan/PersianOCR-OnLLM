@@ -47,15 +47,31 @@ const IMAGE_FORMATS = [
   // …or a plain raw-base64 string.
   { id: 'base64-string',  build: (b64)       => b64 },
 ];
-// Preferred-first order from the env hint (optional); cached winner wins after.
+// Preferred-first order from the env hint (optional).
 let _fmtId = IMAGE_FORMATS.some((f) => f.id === process.env.OCR_IMAGE_MODE) ? process.env.OCR_IMAGE_MODE : null;
+// The format PROVEN to work against the running vision server (via probe).
+// Reset whenever the server starts complaining again (LM Studio restart/upgrade).
+let _negotiated = null;
 
 function orderedFormats() {
-  if (!_fmtId) return IMAGE_FORMATS;
-  const first = IMAGE_FORMATS.filter((f) => f.id === _fmtId);
-  const rest = IMAGE_FORMATS.filter((f) => f.id !== _fmtId);
+  const hint = _negotiated || _fmtId;
+  if (!hint) return IMAGE_FORMATS;
+  const first = IMAGE_FORMATS.filter((f) => f.id === hint);
+  const rest = IMAGE_FORMATS.filter((f) => f.id !== hint);
   return first.concat(rest);
 }
+
+// 1×1 white PNG used to probe which image encoding the server accepts. The
+// probe is a tiny non-streaming request, so negotiation NEVER happens inside a
+// real (possibly streaming) OCR call — streams can't be retried once a token
+// has been emitted, which is exactly how the old in-band negotiation got stuck.
+const PROBE_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+// Payload guard: images bigger than this (decoded bytes) are downscaled with
+// ImageMagick before being sent to the vision server — huge PC screenshots/raw
+// scans otherwise blow the server's request/context limits. 0 disables.
+const LLM_MAX_MB = process.env.OCR_LLM_MAX_MB !== undefined ? Number(process.env.OCR_LLM_MAX_MB) : 4;
+const LLM_MAX_DIM = Number(process.env.OCR_LLM_MAX_DIM) || 2048;
 
 // Multi-pass "self-consistency" OCR. Small models (e.g. gemma-3-4b) misread the
 // odd digit or drop a trailing zero. Running the transcription a few times with a
@@ -67,7 +83,8 @@ const OCR_DRAFT_TEMP = process.env.OCR_DRAFT_TEMP !== undefined ? Number(process
 function getConfig() {
   return {
     url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS,
-    temperature: TEMPERATURE, imageMode: _fmtId || 'auto', passes: OCR_PASSES,
+    temperature: TEMPERATURE, imageMode: _negotiated || _fmtId || 'auto', passes: OCR_PASSES,
+    llmImageGuard: { maxMb: LLM_MAX_MB, maxDim: LLM_MAX_DIM },
     tesseract: textOcr.status(), imageTools: imageQuality.status(), pipeline: pipeline.config,
   };
 }
@@ -103,17 +120,22 @@ function toImage(image) {
   return { b64: s.replace(/^data:[^,]*,/, ''), mime: 'image/jpeg' }; // assume already base64
 }
 
-// Any error where trying a DIFFERENT image format could help: the image-format
-// complaints, plus any 4xx (the server rejected the request shape). 5xx / timeout
-// / network errors are NOT format problems, so we don't cycle formats on those.
-function shouldTryNextFormat(msg) {
-  const s = String(msg || '');
-  return /HTTP 4\d\d/.test(s) || isImageFormatError(s);
+// A complaint about HOW the image was encoded in the request — the only class
+// of error where switching to a different image format can help. Covers every
+// known LM Studio / llama.cpp wording, including:
+//   "Invalid 'content': 'image_url' field must be an object in the form
+//    { image_url: { url: \"...base64 encoded image here...\" } }"
+//   "'url' field must be a base64 encoded image."
+function isImageFormatError(msg) {
+  return /must be an object|must be a base64|base64 encoded image|'url' field|image[_ ]?url|invalid '?content'?/i
+    .test(String(msg || ''));
 }
 
-// A 400 that means "you encoded the image wrong".
-function isImageFormatError(msg) {
-  return /base64 encoded image|must be a base64|'url' field|image[_ ]?url/i.test(String(msg || ''));
+// The request body itself was too big for the server — switching formats can't
+// fix that; the image must be downscaled (or ImageMagick installed).
+function isPayloadError(msg) {
+  return /HTTP 413|payload too large|request entity too large|body.{0,20}limit|exceeds.{0,30}(limit|maximum|length)|context length|too (large|big|long)/i
+    .test(String(msg || ''));
 }
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
@@ -224,7 +246,10 @@ function postStream(url, headers, body, onChunk, timeoutMs) {
         }
         res.setEncoding('utf8');
         let buf = '';
+        let errMsg = '';   // error carried INSIDE a 200 response (SSE error event
+        let raw = '';      // or a plain JSON body) — must not dissolve into ''.
         res.on('data', (chunk) => {
+          if (raw.length < 2000) raw += chunk;
           buf += chunk;
           let idx;
           while ((idx = buf.indexOf('\n')) >= 0) {
@@ -234,12 +259,24 @@ function postStream(url, headers, body, onChunk, timeoutMs) {
             const data = line.slice(5).trim();
             if (data === '[DONE]') continue;
             try {
-              const tok = JSON.parse(data)?.choices?.[0]?.delta?.content || '';
+              const j = JSON.parse(data);
+              if (j?.error) errMsg = typeof j.error === 'string' ? j.error : (j.error.message || JSON.stringify(j.error));
+              const tok = j?.choices?.[0]?.delta?.content || '';
               if (tok) { full += tok; onChunk(tok); }
             } catch { /* keep-alive / partial line */ }
           }
         });
-        res.on('end', () => resolve(full));
+        res.on('end', () => {
+          if (full) return resolve(full);
+          // Nothing was generated. If the body carried an error (SSE error event,
+          // or a non-SSE JSON error body some builds send with status 200), fail
+          // loudly with it instead of resolving to an empty transcription.
+          if (!errMsg && raw.trim()) {
+            try { const j = JSON.parse(raw); if (j?.error) errMsg = typeof j.error === 'string' ? j.error : (j.error.message || JSON.stringify(j.error)); } catch { /* not JSON */ }
+          }
+          if (errMsg) return reject(new Error(`vision model error: ${errMsg}`));
+          resolve(full);
+        });
       }
     );
     req.on('error', reject);
@@ -262,23 +299,85 @@ function visionMessages(instruction, imageUrlValue, userNote) {
 }
 
 /**
- * Core vision call that AUTO-NEGOTIATES the image format. It tries each known
- * request shape (data-URL object, raw-base64 object, string variants) until the
- * server accepts one, then caches the winner so later calls use it directly. It
- * only advances to the next format on a format-ish error (4xx / "must be base64…")
- * and never mid-stream (once a token has been emitted). Net effect: it works with
- * whatever LM Studio / llama.cpp build you point it at — no env needed.
+ * Fit the image to the vision server's appetite: if the decoded bytes exceed
+ * OCR_LLM_MAX_MB, downscale/re-encode with ImageMagick (longest side
+ * OCR_LLM_MAX_DIM, JPEG). Without ImageMagick the original is sent unchanged.
+ * Cached per image object so multi-pass runs don't re-convert every call.
+ */
+const _fitCache = new WeakMap();
+async function fitForModel(image, b64, mime) {
+  if (!LLM_MAX_MB || b64.length * 0.75 <= LLM_MAX_MB * 1024 * 1024) return { b64, mime };
+  const key = image && typeof image === 'object' ? image : null;
+  if (key && _fitCache.has(key)) return _fitCache.get(key);
+  let out = { b64, mime };
+  try {
+    const small = await imageQuality.downscale(Buffer.from(b64, 'base64'), mime, { maxDim: LLM_MAX_DIM });
+    if (small && small.buffer.length < b64.length * 0.75) out = { b64: small.buffer.toString('base64'), mime: small.mime };
+  } catch { /* best-effort — send the original */ }
+  if (key) _fitCache.set(key, out);
+  return out;
+}
+
+/**
+ * Probe ONE image format with a tiny non-streaming request (1×1 PNG, 4 tokens).
+ * Throws with the server's own words when rejected.
+ */
+async function probeFormat(fmt) {
+  const messages = visionMessages('Reply with the single word: OK', fmt.build(PROBE_PNG_B64, 'image/png'), '');
+  const payload = JSON.stringify({ model: AI_MODEL, messages, max_tokens: 4, temperature: 0, stream: false });
+  const { status, body } = await post(`${AI_URL}/chat/completions`, headers(Buffer.byteLength(payload)), payload, 30000);
+  if (status === 200) return;
+  const e = new Error(`vision model HTTP ${status}: ${String(body || '').slice(0, 300)}`);
+  e.status = status;
+  throw e;
+}
+
+/**
+ * Find the image encoding the RUNNING server accepts, once, with cheap probes —
+ * never inside a real (possibly streaming) OCR call, which can't be retried
+ * after the first token. The winner is cached until the server complains again
+ * (LM Studio restart/upgrade), then re-negotiated. OCR_IMAGE_MODE only sets
+ * which format is probed first.
+ */
+let _negotiating = null; // concurrent calls share one probe run
+async function negotiateFormat(force = false) {
+  if (_negotiated && !force) return IMAGE_FORMATS.find((f) => f.id === _negotiated);
+  if (_negotiating) return _negotiating;
+  _negotiating = (async () => {
+    const attempts = [];
+    for (const fmt of orderedFormats()) {
+      try {
+        await probeFormat(fmt);
+        _negotiated = fmt.id;
+        return fmt;
+      } catch (e) {
+        attempts.push(`${fmt.id} → ${e.message}`);
+        // Only a 4xx means "the server disliked this request shape; try another".
+        // Network errors / timeouts / 5xx are the server's problem — surface them.
+        if (!(e.status >= 400 && e.status < 500)) throw e;
+      }
+    }
+    throw new Error(`the vision server rejected every known image encoding. Probe results: ${attempts.join(' | ')}`);
+  })();
+  try { return await _negotiating; } finally { _negotiating = null; }
+}
+
+/**
+ * Core vision call. The image format is negotiated UP FRONT via probeFormat()
+ * (cached across calls), the image is size-guarded via fitForModel(), and if
+ * the server still complains about the encoding mid-flight (it was restarted
+ * with a different build, say) the format is re-negotiated once and the call
+ * retried — unless tokens were already streamed to the client.
  *   opts: { instruction, image:{buffer,mime}|dataUrl, note, temperature, maxTokens, onChunk }
  */
 async function visionCall({ instruction, image, note = '', temperature = TEMPERATURE, maxTokens = MAX_TOKENS, onChunk }) {
-  const { b64, mime } = toImage(image);
+  const raw = toImage(image);
+  const { b64, mime } = await fitForModel(image, raw.b64, raw.mime);
   const stream = typeof onChunk === 'function';
   const url = `${AI_URL}/chat/completions`;
-  const formats = orderedFormats();
 
-  let lastErr;
-  for (let i = 0; i < formats.length; i++) {
-    const fmt = formats[i];
+  let fmt = await negotiateFormat();
+  for (let attempt = 0; ; attempt++) {
     const messages = visionMessages(instruction, fmt.build(b64, mime), note);
     const payload = JSON.stringify({ model: AI_MODEL, messages, max_tokens: maxTokens, temperature, stream });
     let emitted = false;
@@ -290,19 +389,31 @@ async function visionCall({ instruction, image, note = '', temperature = TEMPERA
         out = await postStream(url, h, payload, guard, TIMEOUT_MS);
       } else {
         const { status, body } = await post(url, headers(Buffer.byteLength(payload)), payload, TIMEOUT_MS);
-        if (status !== 200) throw new Error(`vision model HTTP ${status}: ${body.slice(0, 200)}`);
+        if (status !== 200) throw new Error(`vision model HTTP ${status}: ${body.slice(0, 300)}`);
         out = JSON.parse(body)?.choices?.[0]?.message?.content?.trim() || '';
       }
-      _fmtId = fmt.id; // remember the format the server accepted
+      if (!out || !String(out).trim()) {
+        // A silent empty answer is a failure, not a result — and it must never
+        // consecrate the current format as "working".
+        const e = new Error('vision model returned an empty response');
+        e.empty = true;
+        throw e;
+      }
       return out;
     } catch (e) {
-      lastErr = e;
-      // Can't restart once tokens were streamed; and only re-try for a
-      // format-ish error when another format remains.
-      if (emitted || !shouldTryNextFormat(e.message) || i >= formats.length - 1) throw e;
+      if (isPayloadError(e.message)) {
+        throw new Error(`the image is too large for the vision server (${Math.round(b64.length * 0.75 / 1024 / 1024 * 10) / 10} MB sent). Install ImageMagick so the server can downscale automatically (OCR_LLM_MAX_MB/OCR_LLM_MAX_DIM), or upload a smaller photo. Server said: ${e.message}`);
+      }
+      // The negotiated format stopped working (server restarted with another
+      // build?) or the answer came back empty: re-probe once and retry.
+      if (attempt === 0 && !emitted && (isImageFormatError(e.message) || e.empty)) {
+        _negotiated = null;
+        fmt = await negotiateFormat(true);
+        continue;
+      }
+      throw e;
     }
   }
-  throw lastErr;
 }
 
 // ── Adaptive extraction pipeline (deps injected; see extractionPipeline.js) ───
@@ -362,14 +473,18 @@ async function transcribeRefined(image, { note = '', passes = OCR_PASSES, onChun
   const draftInstruction = withReference(TRANSCRIBE_PROMPT, ref);
   // 1) draft passes (non-streaming, a little temperature for useful diversity).
   const drafts = [];
+  let lastErr = null;
   for (let i = 0; i < passes; i++) {
     if (onStatus) onStatus({ phase: 'draft', pass: i + 1, of: passes });
     try {
       const d = await visionCall({ instruction: draftInstruction, image, note, temperature: OCR_DRAFT_TEMP });
       if (d && d.trim()) drafts.push(d.trim());
-    } catch (e) { /* a single failed pass shouldn't sink the batch */ }
+    } catch (e) { lastErr = e; /* a single failed pass shouldn't sink the batch */ }
   }
-  if (!drafts.length) throw new Error('all OCR passes failed');
+  // When every pass failed, surface the REAL underlying error — "all OCR passes
+  // failed" alone told nobody that e.g. the vision server was rejecting the
+  // image encoding or the payload size.
+  if (!drafts.length) throw new Error(`all OCR passes failed${lastErr ? ` — ${lastErr.message}` : ''}`);
   if (drafts.length === 1) { if (onChunk) onChunk(drafts[0]); return drafts[0]; }
 
   // 2) reconciliation pass — image + reference OCR + all drafts, deterministic.
@@ -416,4 +531,9 @@ async function testConnection() {
   }
 }
 
-module.exports = { transcribe, transcribeRefined, extractStructured, testConnection, getConfig };
+module.exports = {
+  transcribe, transcribeRefined, extractStructured, testConnection, getConfig,
+  // exposed for the vision-format tests (and reusable by callers that need a
+  // single raw model call): the core call + the error classifiers.
+  visionCall, isImageFormatError, isPayloadError,
+};

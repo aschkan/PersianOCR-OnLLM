@@ -92,6 +92,25 @@ async function enhance(buffer, mime) {
 }
 
 /**
+ * Downscale/re-encode an oversized image for the vision model: cap the longest
+ * side at `maxDim` (never upscales) and emit JPEG at `quality`. Big PC uploads
+ * (PNG screenshots, raw scans) shrink 5-20× with no OCR-relevant loss, which
+ * keeps the request under the vision server's payload/context limits.
+ * → { buffer, mime:'image/jpeg' } or null (no ImageMagick / conversion failed).
+ */
+async function downscale(buffer, mime, { maxDim = 2048, quality = 85 } = {}) {
+  if (!HAS_CONVERT || !buffer || !buffer.length) return null;
+  const t = tmpFile(buffer, mime);
+  try {
+    const outPath = path.join(t.dir, 'small.jpg');
+    // ">" = only shrink; never blow a small image up.
+    const r = await run(CONVERT_BIN, [t.p + '[0]', '-auto-orient', '-resize', `${maxDim}x${maxDim}>`, '-quality', String(quality), outPath], 30000);
+    if (r.code !== 0 || !fs.existsSync(outPath)) return null;
+    return { buffer: fs.readFileSync(outPath), mime: 'image/jpeg' };
+  } catch { return null; } finally { t.cleanup(); }
+}
+
+/**
  * Crop a horizontal band [top..bottom] (pixel rows) across the full width and
  * upscale it 2× — used to zoom into the amount region for a focused re-read.
  * → { buffer, mime:'image/png' } or null.
@@ -114,4 +133,4 @@ function status() {
   return { identify: HAS_IDENTIFY, convert: HAS_CONVERT, minDim: MIN_DIM, minStddev: MIN_STDDEV };
 }
 
-module.exports = { assess, enhance, cropBand, status };
+module.exports = { assess, enhance, downscale, cropBand, status };

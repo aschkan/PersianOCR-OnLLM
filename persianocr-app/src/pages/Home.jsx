@@ -5,6 +5,7 @@ import { api } from '../api/client';
 import Dropzone from '../components/Dropzone';
 import ResultPanel from '../components/ResultPanel';
 import { ErrorBox, useToast, fmtBytes } from '../components/ui';
+import { maybeCompressImage } from '../utils/compressImage';
 
 export default function Home() {
   const { T } = useT();
@@ -21,6 +22,7 @@ export default function Home() {
   const [structuring, setStructuring] = useState(false);
   const [error, setError] = useState('');
   const startedRef = useRef(false);
+  const pickSeqRef = useRef(0); // ignores a stale async compression result
 
   // Build/tear-down the object URL for the local preview.
   useEffect(() => {
@@ -30,9 +32,16 @@ export default function Home() {
     return () => URL.revokeObjectURL(url);
   }, [file]);
 
-  const chooseFile = (f) => {
+  const chooseFile = async (f) => {
+    const seq = ++pickSeqRef.current;
     setFile(f); setText(''); setReceiptId(null); setStructured(null); setError('');
     startedRef.current = false;
+    // Compress big pictures in the browser before upload (faster upload, and
+    // keeps the request within the vision server's limits). Best-effort: on
+    // any failure the original file is kept. The preview/size badge updates
+    // to the compressed file, unless the user has already picked another one.
+    const c = await maybeCompressImage(f);
+    if (seq === pickSeqRef.current && c !== f) setFile(c);
   };
 
   const reset = () => {

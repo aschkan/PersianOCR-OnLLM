@@ -179,6 +179,23 @@ Tune with `OCR_VERIFY`, `OCR_ADAPTIVE`, `OCR_FIX_ROUNDS`, `OCR_REF_MODE`,
 when a tool is missing. The accuracy logic is pure and tested: `npm test` in
 `persianocr-server/`.
 
+### Image delivery that works on every LM Studio build
+
+Different LM Studio / llama.cpp builds accept the image in different request
+shapes (data-URL object vs raw-base64 object) and reject the rest with errors
+like `'image_url' field must be an object …`. The server now **probes** the
+formats once with a tiny built-in image, caches the one your build accepts, and
+re-negotiates automatically if LM Studio is restarted with a different build —
+so streaming OCR calls never have to guess. Errors the model server reports
+(even inside an HTTP 200 stream) are surfaced verbatim instead of collapsing
+into `all OCR passes failed`.
+
+Oversized uploads are handled twice: the web app compresses big pictures
+in the browser before upload (longest side 2400 px, JPEG), and the server
+downscales anything still above `OCR_LLM_MAX_MB` (default 4 MB) to
+`OCR_LLM_MAX_DIM` (default 2048 px) with ImageMagick before sending it to the
+vision server.
+
 ## Notes
 
 - **No cloud.** Images go only to your LM Studio box (and the local Tesseract);
