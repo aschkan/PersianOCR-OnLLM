@@ -126,10 +126,30 @@ serves the committed `persianocr-app/build` bundle. The proxy terminates TLS for
   } }
 ```
 
+## Accuracy features
+
+Small vision models misread dense receipts — especially large Persian amounts
+(`۲۰٬۰۰۰٬۰۰۰` read as `۲۰٬۰۰۰`). Two opt-in layers fix most of this:
+
+- **Reference OCR (Tesseract).** Install `tesseract-ocr` + `tesseract-ocr-fas`
+  (and `imagemagick` for pre-processing) and the server runs Tesseract on each
+  image and feeds its text to the model as a **digit reference** — the model
+  copies exact numbers/codes instead of guessing. Auto-detected; status shows on
+  the Settings page.
+  ```bash
+  sudo apt install tesseract-ocr tesseract-ocr-fas imagemagick
+  ```
+- **Multi-pass self-consistency (`OCR_PASSES`).** Set `OCR_PASSES=3` to transcribe
+  each image several times and reconcile the attempts against the image in a final
+  proof-reading pass. N+1× slower, noticeably more accurate.
+
+Both combine, and both are just env settings (`OCR_TESSERACT`, `OCR_PASSES`). For
+raw recognition of unusual fonts, also try a bigger model (`OCR_AI_MODEL`).
+
 ## Notes
 
-- **No cloud.** Images go only to your LM Studio box; nothing is sent to any
-  third-party service.
+- **No cloud.** Images go only to your LM Studio box (and the local Tesseract);
+  nothing is sent to any third-party service.
 - **No auth.** This is a single-purpose internal tool; add a gate at the proxy if
   you expose it publicly.
 - OCR quality tracks the loaded model. A stronger vision model (larger gemma,

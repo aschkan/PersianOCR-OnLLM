@@ -45,6 +45,7 @@ const STRINGS = {
     modelStatus: 'وضعیت مدل بینایی',
     checkAgain: 'بررسی مجدد', online: 'در دسترس', offline: 'در دسترس نیست',
     model: 'مدل', endpoint: 'آدرس', latency: 'تأخیر',
+    passes: 'تعداد اسکن', refOcr: 'او‌سی‌آر کمکی', refOcrOff: 'غیرفعال',
     about: 'درباره',
     aboutText: 'این برنامه رسید فارسی را با یک مدل زبانیِ بینایی که به‌صورت محلی روی LM Studio اجرا می‌شود، به متن تبدیل می‌کند. هیچ تصویری به سرویس ابری ارسال نمی‌شود.',
     // misc
@@ -91,6 +92,7 @@ const STRINGS = {
     modelStatus: 'Vision model status',
     checkAgain: 'Check again', online: 'Online', offline: 'Offline',
     model: 'Model', endpoint: 'Endpoint', latency: 'Latency',
+    passes: 'OCR passes', refOcr: 'Reference OCR', refOcrOff: 'off',
     about: 'About',
     aboutText: 'This app converts Persian receipts to text using a vision LLM running locally on LM Studio. No image is sent to any cloud service.',
     status: 'Status', duration: 'Duration', done: 'Done', error: 'Error',

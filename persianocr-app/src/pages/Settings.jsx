@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { RefreshCw, Server, Cpu, Globe, Timer } from 'lucide-react';
+import { RefreshCw, Server, Cpu, Globe, Timer, Layers, ScanText } from 'lucide-react';
 import { useT } from '../i18n/LangContext';
 import { api } from '../api/client';
 import { InlineSpinner } from '../components/ui';
@@ -36,6 +36,13 @@ export default function Settings() {
           <div><div className="k"><Cpu size={13} style={{ verticalAlign: '-2px' }} /> {T.model}</div><div className="v">{status?.config?.model || status?.model || '—'}</div></div>
           <div><div className="k"><Globe size={13} style={{ verticalAlign: '-2px' }} /> {T.endpoint}</div><div className="v" style={{ wordBreak: 'break-all', fontSize: '.85rem' }}>{status?.config?.url || status?.url || '—'}</div></div>
           <div><div className="k"><Timer size={13} style={{ verticalAlign: '-2px' }} /> {T.latency}</div><div className="v">{status?.ms != null ? `${status.ms} ms` : '—'}</div></div>
+          <div><div className="k"><Layers size={13} style={{ verticalAlign: '-2px' }} /> {T.passes}</div><div className="v">{status?.config?.passes ?? '—'}</div></div>
+          <div>
+            <div className="k"><ScanText size={13} style={{ verticalAlign: '-2px' }} /> {T.refOcr}</div>
+            <div className="v">{status?.config?.tesseract?.available
+              ? <span className="tag ok">{status.config.tesseract.lang || 'on'}</span>
+              : <span className="tag warn">{T.refOcrOff}</span>}</div>
+          </div>
         </div>
         {status && !status.ok && status.error && <div className="err" style={{ marginTop: '.7rem' }}>{status.error}</div>}
       </div>

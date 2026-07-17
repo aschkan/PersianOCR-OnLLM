@@ -17,6 +17,7 @@
  */
 const http = require('http');
 const https = require('https');
+const textOcr = require('./textOcr');   // optional Tesseract grounding (digits)
 
 // ── Config (env → built-in defaults) ──────────────────────────────────────────
 const AI_URL      = (process.env.OCR_AI_URL || 'http://localhost:1234/v1').replace(/\/$/, '');
@@ -42,7 +43,28 @@ const OCR_PASSES = Math.max(1, Math.min(6, Number(process.env.OCR_PASSES) || 1))
 const OCR_DRAFT_TEMP = process.env.OCR_DRAFT_TEMP !== undefined ? Number(process.env.OCR_DRAFT_TEMP) : 0.35;
 
 function getConfig() {
-  return { url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS, temperature: TEMPERATURE, imageMode: _imageMode, passes: OCR_PASSES };
+  return { url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS, temperature: TEMPERATURE, imageMode: _imageMode, passes: OCR_PASSES, tesseract: textOcr.status() };
+}
+
+// Run the reference OCR engine (Tesseract) on the image; '' if unavailable.
+async function referenceOcr(image) {
+  if (!textOcr.available()) return '';
+  try {
+    let buf, mime;
+    if (image && image.buffer) { buf = Buffer.from(image.buffer); mime = image.mime; }
+    else { const t = toImage(image); buf = Buffer.from(t.b64, 'base64'); mime = t.mime; }
+    return await textOcr.ocrText(buf, mime);
+  } catch { return ''; }
+}
+
+// Append the reference-OCR text to a prompt so the model copies digits correctly.
+function withReference(instruction, ref) {
+  if (!ref) return instruction;
+  return instruction +
+    '\n\n--- REFERENCE OCR ---\n' +
+    'A traditional OCR engine read the text below from the SAME image. It is reliable for DIGITS, amounts, dates, card and terminal numbers — PREFER these exact numbers over your own reading when they conflict (this is how you avoid dropping zeros, e.g. keep ۲۰٬۰۰۰٬۰۰۰ not ۲۰٬۰۰۰). The engine often garbles Persian words, so use the IMAGE for wording and layout.\n' +
+    ref +
+    '\n--- END REFERENCE OCR ---';
 }
 
 // Normalize whatever the caller passed (a {buffer,mime} or a data-URL string)
@@ -240,8 +262,9 @@ async function visionCall({ instruction, image, note = '', temperature = TEMPERA
  * If onChunk is provided the response is streamed and the full text is returned
  * when done; otherwise a single blocking call is made.
  */
-async function transcribe(image, { note = '', onChunk } = {}) {
-  return visionCall({ instruction: TRANSCRIBE_PROMPT, image, note, onChunk });
+async function transcribe(image, { note = '', onChunk, ref } = {}) {
+  if (ref === undefined) ref = await referenceOcr(image);
+  return visionCall({ instruction: withReference(TRANSCRIBE_PROMPT, ref), image, note, onChunk });
 }
 
 /**
@@ -253,24 +276,27 @@ async function transcribe(image, { note = '', onChunk } = {}) {
  */
 async function transcribeRefined(image, { note = '', passes = OCR_PASSES, onChunk, onStatus } = {}) {
   passes = Math.max(1, Math.min(6, Number(passes) || 1));
-  if (passes <= 1) return transcribe(image, { note, onChunk });
+  // Reference OCR once, reused across every pass (grounds digits everywhere).
+  const ref = await referenceOcr(image);
+  if (passes <= 1) return transcribe(image, { note, onChunk, ref });
 
+  const draftInstruction = withReference(TRANSCRIBE_PROMPT, ref);
   // 1) draft passes (non-streaming, a little temperature for useful diversity).
   const drafts = [];
   for (let i = 0; i < passes; i++) {
     if (onStatus) onStatus({ phase: 'draft', pass: i + 1, of: passes });
     try {
-      const d = await visionCall({ instruction: TRANSCRIBE_PROMPT, image, note, temperature: OCR_DRAFT_TEMP });
+      const d = await visionCall({ instruction: draftInstruction, image, note, temperature: OCR_DRAFT_TEMP });
       if (d && d.trim()) drafts.push(d.trim());
     } catch (e) { /* a single failed pass shouldn't sink the batch */ }
   }
   if (!drafts.length) throw new Error('all OCR passes failed');
   if (drafts.length === 1) { if (onChunk) onChunk(drafts[0]); return drafts[0]; }
 
-  // 2) reconciliation pass — image + all drafts, deterministic, streamed out.
+  // 2) reconciliation pass — image + reference OCR + all drafts, deterministic.
   if (onStatus) onStatus({ phase: 'reconcile', of: passes });
   const attempts = drafts.map((d, i) => `### Attempt ${i + 1}\n${d}`).join('\n\n');
-  const instruction = `${RECONCILE_PROMPT}\n\n--- OCR ATTEMPTS ---\n${attempts}`;
+  const instruction = withReference(`${RECONCILE_PROMPT}\n\n--- OCR ATTEMPTS ---\n${attempts}`, ref);
   return visionCall({ instruction, image, note, temperature: 0, onChunk });
 }
 
@@ -280,7 +306,8 @@ async function transcribeRefined(image, { note = '', passes = OCR_PASSES, onChun
  * didn't return valid JSON), `raw` is the model's raw string for debugging.
  */
 async function extractStructured(image, { note = '' } = {}) {
-  const raw = await visionCall({ instruction: STRUCTURE_PROMPT, image, note, temperature: 0 });
+  const ref = await referenceOcr(image);
+  const raw = await visionCall({ instruction: withReference(STRUCTURE_PROMPT, ref), image, note, temperature: 0 });
   return { data: parseJsonLoose(raw), raw };
 }
 
