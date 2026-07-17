@@ -30,10 +30,30 @@ const TEMPERATURE = process.env.OCR_TEMPERATURE !== undefined ? Number(process.e
 // How to encode the image in `image_url.url`. Different LM Studio / llama.cpp
 // builds disagree: some want a full data-URL, others reject it and demand the
 // RAW base64 ("'url' field must be a base64 encoded image."). 'auto' tries the
-// data-URL first, falls back to raw base64 on that error, and remembers whatever
-// worked. Force one with OCR_IMAGE_MODE=dataurl|base64.
-const IMAGE_MODES = ['dataurl', 'base64'];
-let _imageMode = IMAGE_MODES.includes(process.env.OCR_IMAGE_MODE) ? process.env.OCR_IMAGE_MODE : 'auto';
+// worked. It just works — no env needed. OCR_IMAGE_MODE only sets which format
+// to TRY FIRST (still falls back to the others), so a wrong value can't break it.
+//
+// Different OpenAI-compatible / LM Studio / llama.cpp builds accept the image in
+// different shapes. We try each until one is accepted, then cache the winner.
+const IMAGE_FORMATS = [
+  // Standard OpenAI: image_url is an object with a data-URL.
+  { id: 'dataurl',        build: (b64, mime) => ({ url: `data:${mime};base64,${b64}` }) },
+  // Some builds want the RAW base64 in url ("'url' field must be a base64…").
+  { id: 'base64',         build: (b64)       => ({ url: b64 }) },
+  // Some accept image_url as a plain string data-URL (not an object).
+  { id: 'dataurl-string', build: (b64, mime) => `data:${mime};base64,${b64}` },
+  // …or a plain raw-base64 string.
+  { id: 'base64-string',  build: (b64)       => b64 },
+];
+// Preferred-first order from the env hint (optional); cached winner wins after.
+let _fmtId = IMAGE_FORMATS.some((f) => f.id === process.env.OCR_IMAGE_MODE) ? process.env.OCR_IMAGE_MODE : null;
+
+function orderedFormats() {
+  if (!_fmtId) return IMAGE_FORMATS;
+  const first = IMAGE_FORMATS.filter((f) => f.id === _fmtId);
+  const rest = IMAGE_FORMATS.filter((f) => f.id !== _fmtId);
+  return first.concat(rest);
+}
 
 // Multi-pass "self-consistency" OCR. Small models (e.g. gemma-3-4b) misread the
 // odd digit or drop a trailing zero. Running the transcription a few times with a
@@ -43,7 +63,7 @@ const OCR_PASSES = Math.max(1, Math.min(6, Number(process.env.OCR_PASSES) || 1))
 const OCR_DRAFT_TEMP = process.env.OCR_DRAFT_TEMP !== undefined ? Number(process.env.OCR_DRAFT_TEMP) : 0.35;
 
 function getConfig() {
-  return { url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS, temperature: TEMPERATURE, imageMode: _imageMode, passes: OCR_PASSES, tesseract: textOcr.status() };
+  return { url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS, temperature: TEMPERATURE, imageMode: _fmtId || 'auto', passes: OCR_PASSES, tesseract: textOcr.status() };
 }
 
 // Run the reference OCR engine (Tesseract) on the image; '' if unavailable.
@@ -77,11 +97,15 @@ function toImage(image) {
   return { b64: s.replace(/^data:[^,]*,/, ''), mime: 'image/jpeg' }; // assume already base64
 }
 
-function imageUrlFor(b64, mime, mode) {
-  return mode === 'base64' ? b64 : `data:${mime};base64,${b64}`;
+// Any error where trying a DIFFERENT image format could help: the image-format
+// complaints, plus any 4xx (the server rejected the request shape). 5xx / timeout
+// / network errors are NOT format problems, so we don't cycle formats on those.
+function shouldTryNextFormat(msg) {
+  const s = String(msg || '');
+  return /HTTP 4\d\d/.test(s) || isImageFormatError(s);
 }
 
-// A 400 that means "you encoded the image wrong" — trigger the mode fallback.
+// A 400 that means "you encoded the image wrong".
 function isImageFormatError(msg) {
   return /base64 encoded image|must be a base64|'url' field|image[_ ]?url/i.test(String(msg || ''));
 }
@@ -97,7 +121,7 @@ const TRANSCRIBE_PROMPT = [
   '- Output the transcription only. No preamble, no explanation, no summary, no code fences.',
   '- Do NOT translate. Keep Persian text in Persian and keep the original digits (Persian ۰-۹ or English) exactly as written.',
   '- Preserve the reading order and line breaks of the document (Persian reads right-to-left).',
-  '- Render any table (items, quantities, prices, totals) as a GitHub-flavoured Markdown table with the original column headers.',
+  '- Do NOT build Markdown or ASCII tables. For rows of items/prices, put each row on its own line with its values separated by " — " (e.g. "شیر — ۲ — ۴۸٬۰۰۰"). Keep it as clean readable lines; the structured extractor builds the real table.',
   '- NUMBERS ARE CRITICAL. Persian prices (ریال/تومان) are usually large — thousands or millions. Read every digit carefully and copy the FULL number; never drop trailing zeros (e.g. keep ۱٬۲۰۰٬۰۰۰, do NOT shorten it to ۱۲۰۰). Keep the thousands separators exactly as printed.',
   '- Keep every number, unit (ریال/تومان), date, phone number and code faithful — do not round, reformat or invent values.',
   '- For unclear or illegible handwriting, transcribe your best guess and mark it with «؟» right after the uncertain part.',
@@ -207,48 +231,52 @@ function headers(len) {
   return h;
 }
 
-/** Build the multimodal message array (text instruction + image). */
-function visionMessages(instruction, imageUrl, userNote) {
+/** Build the multimodal message array (text instruction + image_url value). */
+function visionMessages(instruction, imageUrlValue, userNote) {
   const content = [{ type: 'text', text: userNote ? `${instruction}\n\nExtra context from the user: ${userNote}` : instruction }];
-  content.push({ type: 'image_url', image_url: { url: imageUrl } });
+  content.push({ type: 'image_url', image_url: imageUrlValue });
   return [{ role: 'user', content }];
 }
 
 /**
- * Core vision call with image-encoding fallback. Tries the current image mode;
- * on an "image encoded wrong" 400 it flips the mode once and retries, caching the
- * mode that works. For streaming, the 400 arrives before any token so the retry
- * is safe.
+ * Core vision call that AUTO-NEGOTIATES the image format. It tries each known
+ * request shape (data-URL object, raw-base64 object, string variants) until the
+ * server accepts one, then caches the winner so later calls use it directly. It
+ * only advances to the next format on a format-ish error (4xx / "must be base64…")
+ * and never mid-stream (once a token has been emitted). Net effect: it works with
+ * whatever LM Studio / llama.cpp build you point it at — no env needed.
  *   opts: { instruction, image:{buffer,mime}|dataUrl, note, temperature, maxTokens, onChunk }
  */
 async function visionCall({ instruction, image, note = '', temperature = TEMPERATURE, maxTokens = MAX_TOKENS, onChunk }) {
   const { b64, mime } = toImage(image);
   const stream = typeof onChunk === 'function';
   const url = `${AI_URL}/chat/completions`;
-  const modes = _imageMode === 'auto' ? IMAGE_MODES.slice() : [_imageMode];
+  const formats = orderedFormats();
 
   let lastErr;
-  for (let i = 0; i < modes.length; i++) {
-    const mode = modes[i];
-    const messages = visionMessages(instruction, imageUrlFor(b64, mime, mode), note);
+  for (let i = 0; i < formats.length; i++) {
+    const fmt = formats[i];
+    const messages = visionMessages(instruction, fmt.build(b64, mime), note);
     const payload = JSON.stringify({ model: AI_MODEL, messages, max_tokens: maxTokens, temperature, stream });
+    let emitted = false;
+    const guard = (t) => { emitted = true; onChunk(t); };
     try {
       let out;
       if (stream) {
         const h = headers(Buffer.byteLength(payload)); h['Accept'] = 'text/event-stream';
-        out = await postStream(url, h, payload, onChunk, TIMEOUT_MS);
+        out = await postStream(url, h, payload, guard, TIMEOUT_MS);
       } else {
         const { status, body } = await post(url, headers(Buffer.byteLength(payload)), payload, TIMEOUT_MS);
         if (status !== 200) throw new Error(`vision model HTTP ${status}: ${body.slice(0, 200)}`);
         out = JSON.parse(body)?.choices?.[0]?.message?.content?.trim() || '';
       }
-      _imageMode = mode; // remember the encoding that worked
+      _fmtId = fmt.id; // remember the format the server accepted
       return out;
     } catch (e) {
       lastErr = e;
-      // Only fall through to the next encoding for a format error, and only if
-      // there IS a next one to try.
-      if (!(isImageFormatError(e.message) && i < modes.length - 1)) throw e;
+      // Can't restart once tokens were streamed; and only re-try for a
+      // format-ish error when another format remains.
+      if (emitted || !shouldTryNextFormat(e.message) || i >= formats.length - 1) throw e;
     }
   }
   throw lastErr;

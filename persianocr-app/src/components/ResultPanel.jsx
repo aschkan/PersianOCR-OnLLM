@@ -14,7 +14,7 @@ import StructuredView from './StructuredView';
  */
 export default function ResultPanel({
   text, streaming = false, receiptId = null,
-  structured = null, onStructured, onSaveText, onReprocess,
+  structured = null, structuring = false, onStructured, onSaveText, onReprocess,
   showOpenDetail = false, onToast,
 }) {
   const { T } = useT();
@@ -103,11 +103,14 @@ export default function ResultPanel({
         </div>
       )}
 
-      {/* structured extraction */}
-      {structured && (
-        <div style={{ marginTop: '1.25rem', borderTop: '1px solid hsl(var(--bc)/.12)', paddingTop: '1rem' }}>
-          <h3>{T.structuredTitle}</h3>
-          <StructuredView data={structured} />
+      {/* structured extraction (auto-run after transcription; nicer table) */}
+      {(structured || structuring) && (
+        <div style={{ marginTop: '1.25rem', borderTop: '1px solid rgb(var(--line))', paddingTop: '1rem' }}>
+          <div className="row" style={{ marginBottom: '.4rem' }}>
+            <h3 style={{ margin: 0 }}>{T.structuredTitle}</h3>
+            {structuring && <span className="tag proc"><InlineSpinner /> {T.extracting}</span>}
+          </div>
+          {structured ? <StructuredView data={structured} /> : <div className="muted small">{T.extracting}</div>}
         </div>
       )}
     </div>

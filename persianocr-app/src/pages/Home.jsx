@@ -18,6 +18,7 @@ export default function Home() {
   const [text, setText] = useState('');
   const [receiptId, setReceiptId] = useState(null);
   const [structured, setStructured] = useState(null);
+  const [structuring, setStructuring] = useState(false);
   const [error, setError] = useState('');
   const startedRef = useRef(false);
 
@@ -36,19 +37,26 @@ export default function Home() {
 
   const reset = () => {
     setFile(null); setNote(''); setText(''); setReceiptId(null);
-    setStructured(null); setError(''); setStreaming(false); startedRef.current = false;
+    setStructured(null); setStructuring(false); setError(''); setStreaming(false); startedRef.current = false;
   };
 
   const start = async () => {
     if (!file || streaming) return;
     setStreaming(true); setError(''); setText(''); setStructured(null); startedRef.current = true;
+    let id;
     try {
-      const { id } = await api.transcribeStream(file, note, (full) => setText(full));
+      ({ id } = await api.transcribeStream(file, note, (full) => setText(full)));
       setReceiptId(id);
     } catch (e) {
       setError(e.message || T.ocrFailed);
     } finally {
       setStreaming(false);
+    }
+    // Auto-extract the structured invoice — its table is cleaner than the raw
+    // transcription, so we surface it without making the user click.
+    if (id) {
+      setStructuring(true);
+      try { const r = await api.structure(id); setStructured(r.structured); } catch { /* keep the transcription */ } finally { setStructuring(false); }
     }
   };
 
@@ -110,6 +118,7 @@ export default function Home() {
                 streaming={streaming}
                 receiptId={receiptId}
                 structured={structured}
+                structuring={structuring}
                 onStructured={setStructured}
                 onSaveText={receiptId ? saveText : null}
                 onReprocess={receiptId ? reprocess : null}
