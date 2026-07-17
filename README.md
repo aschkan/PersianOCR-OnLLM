@@ -190,11 +190,20 @@ so streaming OCR calls never have to guess. Errors the model server reports
 (even inside an HTTP 200 stream) are surfaced verbatim instead of collapsing
 into `all OCR passes failed`.
 
-Oversized uploads are handled twice: the web app compresses big pictures
-in the browser before upload (longest side 2400 px, JPEG), and the server
-downscales anything still above `OCR_LLM_MAX_MB` (default 4 MB) to
-`OCR_LLM_MAX_DIM` (default 2048 px) with ImageMagick before sending it to the
-vision server.
+Oversized uploads are handled twice: the web app compresses any picture over
+**1 MB** in the browser before upload (JPEG, walking a quality/size ladder down
+until it fits), and the server downscales anything still above
+`OCR_LLM_MAX_MB` (default 1 MB) to `OCR_LLM_MAX_DIM` (default 2048 px) with
+ImageMagick before sending it to the vision server.
+
+**Fail fast when LM Studio is unreachable.** Every OCR endpoint now runs a
+4-second reachability preflight first. If the GPU box is off, LM Studio's
+server isn't started, the IP is wrong or a firewall is in the way, the UI
+immediately shows the target URL plus what to check (e.g. *connection refused —
+open LM Studio → Developer → Start Server, enable "Serve on Local Network"*)
+instead of a generic `all OCR passes failed`. Connection errors also abort
+multi-pass runs on the first failure, and the Settings page's status check
+reports the same diagnostic.
 
 ## Notes
 

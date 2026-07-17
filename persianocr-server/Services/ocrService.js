@@ -70,7 +70,7 @@ const PROBE_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42
 // Payload guard: images bigger than this (decoded bytes) are downscaled with
 // ImageMagick before being sent to the vision server — huge PC screenshots/raw
 // scans otherwise blow the server's request/context limits. 0 disables.
-const LLM_MAX_MB = process.env.OCR_LLM_MAX_MB !== undefined ? Number(process.env.OCR_LLM_MAX_MB) : 4;
+const LLM_MAX_MB = process.env.OCR_LLM_MAX_MB !== undefined ? Number(process.env.OCR_LLM_MAX_MB) : 1;
 const LLM_MAX_DIM = Number(process.env.OCR_LLM_MAX_DIM) || 2048;
 
 // Multi-pass "self-consistency" OCR. Small models (e.g. gemma-3-4b) misread the
@@ -136,6 +136,30 @@ function isImageFormatError(msg) {
 function isPayloadError(msg) {
   return /HTTP 413|payload too large|request entity too large|body.{0,20}limit|exceeds.{0,30}(limit|maximum|length)|context length|too (large|big|long)/i
     .test(String(msg || ''));
+}
+
+// The request never reached (or never came back from) the vision server at all
+// — LM Studio down, wrong IP/port, firewall, dead network. Retrying passes or
+// switching image formats cannot help; the user needs the REASON and the URL.
+function isConnectionError(msg) {
+  return /ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|vision (model|server) timeout/i
+    .test(String(msg || ''));
+}
+
+/** Turn a raw socket error into an actionable message with the target URL. */
+function describeConnectionError(msg) {
+  const s = String(msg || '');
+  let hint;
+  if (/ECONNREFUSED/i.test(s)) {
+    hint = 'connection refused — nothing is listening there. In LM Studio open the Developer tab and Start Server (enable "Serve on Local Network"), and check OCR_AI_URL host/port';
+  } else if (/ENOTFOUND|EAI_AGAIN/i.test(s)) {
+    hint = 'the hostname does not resolve — check OCR_AI_URL';
+  } else if (/ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|timeout/i.test(s)) {
+    hint = 'no response — check the GPU machine is on and reachable (same network, correct IP) and that its firewall allows the LM Studio port';
+  } else {
+    hint = 'the connection failed before the model could run';
+  }
+  return `cannot reach the vision server at ${AI_URL}: ${hint} (${s})`;
 }
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
@@ -291,6 +315,40 @@ function headers(len) {
   return h;
 }
 
+/** Tiny GET (used by the reachability preflight — LM Studio serves /v1/models). */
+function get(url, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = pickLib(u).request(
+      { hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443), path: u.pathname + u.search, method: 'GET', headers: AI_KEY ? { Authorization: `Bearer ${AI_KEY}` } : {}, timeout: timeoutMs },
+      (res) => { const c = []; res.on('data', (d) => c.push(d)); res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(c).toString() })); }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('vision server timeout')); });
+    req.end();
+  });
+}
+
+/**
+ * Cheap reachability preflight, run by the controllers BEFORE any OCR work
+ * starts: one 4-second GET /models. When the GPU box is off / LM Studio isn't
+ * serving / the IP is wrong, the user gets the precise reason immediately —
+ * instead of Tesseract grinding, N silent passes and a bare "all OCR passes
+ * failed". A success is cached for 60 s so back-to-back requests skip the hop.
+ */
+let _reachableAt = 0;
+async function preflight(force = false) {
+  if (!force && Date.now() - _reachableAt < 60000) return { ok: true, cached: true };
+  try {
+    const { status } = await get(`${AI_URL}/models`, 4000);
+    // Any HTTP answer (even 404 on exotic builds) proves the server is there.
+    if (status && status < 500) { _reachableAt = Date.now(); return { ok: true, status }; }
+    return { ok: false, error: `the vision server at ${AI_URL} responded HTTP ${status} — LM Studio is reachable but unhealthy` };
+  } catch (e) {
+    return { ok: false, error: describeConnectionError(e.message) };
+  }
+}
+
 /** Build the multimodal message array (text instruction + image_url value). */
 function visionMessages(instruction, imageUrlValue, userNote) {
   const content = [{ type: 'text', text: userNote ? `${instruction}\n\nExtra context from the user: ${userNote}` : instruction }];
@@ -369,8 +427,21 @@ async function negotiateFormat(force = false) {
  * with a different build, say) the format is re-negotiated once and the call
  * retried — unless tokens were already streamed to the client.
  *   opts: { instruction, image:{buffer,mime}|dataUrl, note, temperature, maxTokens, onChunk }
+ * Connection-class failures (LM Studio down / wrong IP / firewall) are rewritten
+ * into an actionable message carrying the target URL — see describeConnectionError.
  */
-async function visionCall({ instruction, image, note = '', temperature = TEMPERATURE, maxTokens = MAX_TOKENS, onChunk }) {
+async function visionCall(opts) {
+  try {
+    return await visionCallInner(opts);
+  } catch (e) {
+    if (isConnectionError(e.message) && !/cannot reach the vision server/.test(e.message)) {
+      throw new Error(describeConnectionError(e.message));
+    }
+    throw e;
+  }
+}
+
+async function visionCallInner({ instruction, image, note = '', temperature = TEMPERATURE, maxTokens = MAX_TOKENS, onChunk }) {
   const raw = toImage(image);
   const { b64, mime } = await fitForModel(image, raw.b64, raw.mime);
   const stream = typeof onChunk === 'function';
@@ -479,7 +550,13 @@ async function transcribeRefined(image, { note = '', passes = OCR_PASSES, onChun
     try {
       const d = await visionCall({ instruction: draftInstruction, image, note, temperature: OCR_DRAFT_TEMP });
       if (d && d.trim()) drafts.push(d.trim());
-    } catch (e) { lastErr = e; /* a single failed pass shouldn't sink the batch */ }
+    } catch (e) {
+      lastErr = e;
+      // A connection-class failure hits every pass identically — abort with the
+      // real reason NOW instead of burning N silent retries into a generic error.
+      if (isConnectionError(e.message) || /cannot reach the vision server/.test(e.message)) throw e;
+      /* otherwise a single failed pass shouldn't sink the batch */
+    }
   }
   // When every pass failed, surface the REAL underlying error — "all OCR passes
   // failed" alone told nobody that e.g. the vision server was rejecting the
@@ -527,13 +604,16 @@ async function testConnection() {
     if (status !== 200) return { ok: false, error: `HTTP ${status}`, url: AI_URL, model: AI_MODEL };
     return { ok: true, ms: Date.now() - t0, url: AI_URL, model: AI_MODEL };
   } catch (e) {
-    return { ok: false, error: String(e.message || e), url: AI_URL, model: AI_MODEL };
+    const m = String(e.message || e);
+    return { ok: false, error: isConnectionError(m) ? describeConnectionError(m) : m, url: AI_URL, model: AI_MODEL };
   }
 }
 
 module.exports = {
   transcribe, transcribeRefined, extractStructured, testConnection, getConfig,
-  // exposed for the vision-format tests (and reusable by callers that need a
-  // single raw model call): the core call + the error classifiers.
-  visionCall, isImageFormatError, isPayloadError,
+  // reachability preflight — controllers call this before starting any OCR work
+  preflight,
+  // exposed for the vision-format/connection tests (and reusable by callers
+  // that need a single raw model call): the core call + the error classifiers.
+  visionCall, isImageFormatError, isPayloadError, isConnectionError,
 };

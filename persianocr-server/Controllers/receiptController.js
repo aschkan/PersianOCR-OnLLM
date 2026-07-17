@@ -29,6 +29,10 @@ function snippet(text, n = 160) {
  */
 exports.createStream = async (req, res, next) => {
   if (!req.file) return next(new AppError('No image uploaded (field "image")', 400));
+  // Fail fast with the REAL reason when the vision server is unreachable — a
+  // clear 502 up front beats streaming headers and dying pass by pass.
+  const pre = await ocr.preflight();
+  if (!pre.ok) return next(new AppError(pre.error, 502));
   const note = (req.body?.note || '').toString().slice(0, 500);
 
   const id = new mongoose.Types.ObjectId();
@@ -80,6 +84,8 @@ exports.createStream = async (req, res, next) => {
  */
 exports.create = async (req, res, next) => {
   if (!req.file) return next(new AppError('No image uploaded (field "image")', 400));
+  const pre = await ocr.preflight();
+  if (!pre.ok) return next(new AppError(pre.error, 502));
   const note = (req.body?.note || '').toString().slice(0, 500);
 
   const id = new mongoose.Types.ObjectId();
@@ -159,6 +165,8 @@ exports.structure = async (req, res, next) => {
     if (!doc) return next(new AppError('Receipt not found', 404));
     const buf = readImage(doc.imageFile);
     if (!buf) return next(new AppError('Original image is no longer available', 410));
+    const pre = await ocr.preflight();
+    if (!pre.ok) return next(new AppError(pre.error, 502));
 
     // The stored transcription grounds the verifier's amount-in-words /
     // currency / identifier checks (the pipeline works without it too).
@@ -180,6 +188,8 @@ exports.reprocess = async (req, res, next) => {
     if (!doc) return next(new AppError('Receipt not found', 404));
     const buf = readImage(doc.imageFile);
     if (!buf) return next(new AppError('Original image is no longer available', 410));
+    const pre = await ocr.preflight();
+    if (!pre.ok) return next(new AppError(pre.error, 502));
 
     const started = Date.now();
     doc.text = await ocr.transcribeRefined({ buffer: buf, mime: doc.mime }, { note: doc.note });
