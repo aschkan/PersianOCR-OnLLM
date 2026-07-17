@@ -68,6 +68,7 @@ export default function Home() {
   return (
     <div>
       <div className="hero">
+        <span className="eyebrow"><Sparkles size={14} /> {T.heroEyebrow}</span>
         <h1><span className="grad">{T.heroTitle}</span></h1>
         <p>{T.heroSub}</p>
       </div>

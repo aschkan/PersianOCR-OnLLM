@@ -1,16 +1,14 @@
 import React from 'react';
+import { Sun, Moon } from 'lucide-react';
 import { useTheme } from '../theme/ThemeContext';
 
-/** A compact row of palette swatches. */
+/** Light/dark (paper/ink) toggle. */
 export default function ThemeSwitcher() {
-  const { theme, setTheme, themes } = useTheme();
+  const { theme, toggleTheme } = useTheme();
+  const dark = theme === 'dark';
   return (
-    <div className="themebar">
-      {themes.map((t) => (
-        <button key={t.id} type="button" title={t.name} aria-label={t.name}
-          className={`swatch ${theme === t.id ? 'active' : ''}`} style={{ background: t.swatch }}
-          onClick={() => setTheme(t.id)} />
-      ))}
-    </div>
+    <button className="icon-btn" onClick={toggleTheme} title={dark ? 'Light' : 'Dark'} aria-label="toggle theme">
+      {dark ? <Sun size={18} /> : <Moon size={18} />}
+    </button>
   );
 }

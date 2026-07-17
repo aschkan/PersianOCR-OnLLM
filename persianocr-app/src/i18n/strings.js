@@ -7,6 +7,7 @@ const STRINGS = {
     // nav
     navUpload: 'تبدیل رسید', navHistory: 'تاریخچه', navSettings: 'تنظیمات',
     // home
+    heroEyebrow: 'او‌سی‌آر هوشمند · کاملاً محلی',
     heroTitle: 'تبدیل رسید فارسی به متن',
     heroSub: 'عکس رسید (چاپی، جدولی یا دست‌نویس) را بارگذاری کنید تا مدل هوش مصنوعیِ بینایی، تمام متن آن را دقیق استخراج کند.',
     dropTitle: 'عکس رسید را اینجا رها کنید',
@@ -57,6 +58,7 @@ const STRINGS = {
     appName: 'Persian OCR',
     tagline: 'Turn Persian receipts & invoices into accurate text',
     navUpload: 'Convert', navHistory: 'History', navSettings: 'Settings',
+    heroEyebrow: 'Smart OCR · Fully on-device',
     heroTitle: 'Persian receipt → text',
     heroSub: 'Upload a receipt photo (printed, tabular, or handwritten) and a local vision LLM transcribes every bit of it faithfully.',
     dropTitle: 'Drop a receipt image here',
