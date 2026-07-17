@@ -81,8 +81,8 @@ async function referenceOcr(image) {
 function withReference(instruction, ref) {
   if (!ref) return instruction;
   return instruction +
-    '\n\n--- REFERENCE OCR ---\n' +
-    'A traditional OCR engine read the text below from the SAME image. It is reliable for DIGITS, amounts, dates, card and terminal numbers — PREFER these exact numbers over your own reading when they conflict (this is how you avoid dropping zeros, e.g. keep ۲۰٬۰۰۰٬۰۰۰ not ۲۰٬۰۰۰). The engine often garbles Persian words, so use the IMAGE for wording and layout.\n' +
+    '\n\n--- REFERENCE OCR (advisory only) ---\n' +
+    'A traditional OCR engine read the text below from the SAME image. Use it ONLY to double-check your own reading of long amounts (e.g. confirm you did not drop a zero on the total). The IMAGE is the ground truth. Do NOT blindly copy these numbers: the engine cannot tell an amount from a cheque/account/reference/card number, so decide each number\'s ROLE from the image and the labels, not from this text. When it conflicts with the amount-in-words on the receipt, the words win.\n' +
     ref +
     '\n--- END REFERENCE OCR ---';
 }
@@ -122,7 +122,9 @@ const TRANSCRIBE_PROMPT = [
   '- Do NOT translate. Keep Persian text in Persian and keep the original digits (Persian ۰-۹ or English) exactly as written.',
   '- Preserve the reading order and line breaks of the document (Persian reads right-to-left).',
   '- Do NOT build Markdown or ASCII tables. For rows of items/prices, put each row on its own line with its values separated by " — " (e.g. "شیر — ۲ — ۴۸٬۰۰۰"). Keep it as clean readable lines; the structured extractor builds the real table.',
-  '- NUMBERS ARE CRITICAL. Persian prices (ریال/تومان) are usually large — thousands or millions. Read every digit carefully and copy the FULL number; never drop trailing zeros (e.g. keep ۱٬۲۰۰٬۰۰۰, do NOT shorten it to ۱۲۰۰). Keep the thousands separators exactly as printed.',
+  '- NUMBERS ARE CRITICAL. Persian prices (ریال/تومان) are usually large — thousands or millions. Read every digit carefully and copy the FULL number; never drop OR add trailing zeros (keep ۱٬۲۰۰٬۰۰۰ exactly). Keep the thousands separators exactly as printed.',
+  '- If the receipt also writes an amount in words («به حروف …»), transcribe it verbatim — it is the reliable check for the numeric amount.',
+  '- Keep the currency unit exactly as printed (ریال vs تومان) — they are different (1 تومان = 10 ریال). Do not convert.',
   '- Keep every number, unit (ریال/تومان), date, phone number and code faithful — do not round, reformat or invent values.',
   '- For unclear or illegible handwriting, transcribe your best guess and mark it with «؟» right after the uncertain part.',
   '- If part of the image is empty or not text, simply skip it.',
@@ -147,23 +149,32 @@ const RECONCILE_PROMPT = [
 // Structured extraction → strict JSON. Kept separate so each call is one focused
 // task, which a 4B model handles far more reliably than a combined mega-prompt.
 const STRUCTURE_PROMPT = [
-  'You extract structured data from a Persian (Farsi) receipt/invoice image.',
+  'You are a forensic accountant extracting structured data from a Persian (Farsi) receipt / invoice / cheque-payment-order image.',
   'Return ONE strict, minified JSON object and nothing else — no markdown, no comments, no code fences.',
-  'Use this exact shape; use null (or [] for items) when a field is not present. Convert Persian digits to English digits in NUMERIC fields only:',
+  '',
+  'ACCURACY RULES — follow them exactly, they prevent the most common mistakes:',
+  '1) AMOUNT IN WORDS IS THE SOURCE OF TRUTH. Persian receipts usually write the amount twice: in digits («به عدد» / «مبلغ») and in words («به حروف …»). Find the words (e.g. «دوازده میلیون ریال») and convert them to a number (دوازده میلیون = 12,000,000; یک میلیارد = 1,000,000,000). If the digits you read disagree with the words, TRUST THE WORDS and set the total to the words value. This is how you avoid adding or dropping a zero.',
+  '2) CURRENCY comes ONLY from the unit printed next to the amount: «ریال» → "IRR", «تومان» → "IRT". Never convert or assume. If it says ریال, it is IRR even if the number looks big.',
+  '3) IDENTIFIERS ARE NOT MONEY. Cheque numbers (شماره چک), account numbers (شماره حساب), reference/tracking numbers (مرجع/پیگیری), terminal (ترمینال), card and phone numbers, and dates must NEVER be placed in unitPrice/total/subtotal. A number is money ONLY if it is in a مبلغ/ریال/تومان column. Long ID-like numbers (e.g. 987650, 9988766, 123456) are not prices.',
+  '4) Do the arithmetic as a check: qty × unitPrice = total per line; the money-column values should sum to the total; and the total must equal the amount-in-words. Fix any field that fails.',
+  '5) Never invent or pad digits. Copy amounts exactly; use null when unsure.',
+  '',
+  'Return this exact shape; use null (or [] for items) when a field is absent. Persian digits → English digits in NUMERIC fields only:',
   '{',
   '  "merchant": string|null,        // shop / business name',
   '  "branch": string|null,',
   '  "address": string|null,',
   '  "phone": string|null,',
-  '  "invoiceNumber": string|null,',
+  '  "invoiceNumber": string|null,   // the document/serial number, NOT the date',
   '  "date": string|null,            // keep as printed (e.g. Jalali 1403/02/15)',
   '  "time": string|null,',
+  '  "amountInWords": string|null,   // the exact «به حروف …» text if present',
   '  "items": [ { "name": string, "qty": number|null, "unitPrice": number|null, "total": number|null } ],',
   '  "subtotal": number|null,',
   '  "discount": number|null,',
   '  "tax": number|null,',
-  '  "total": number|null,',
-  '  "currency": string|null,        // "IRR" (ریال) or "IRT" (تومان) if stated, else null',
+  '  "total": number|null,           // MUST equal amountInWords when that is present',
+  '  "currency": string|null,        // "IRR" (ریال) or "IRT" (تومان) — from the printed unit',
   '  "paymentMethod": string|null',
   '}',
 ].join('\n');
