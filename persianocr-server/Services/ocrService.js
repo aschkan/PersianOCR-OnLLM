@@ -356,21 +356,36 @@ function visionMessages(instruction, imageUrlValue, userNote) {
   return [{ role: 'user', content }];
 }
 
+// Mime types the llama.cpp / LM Studio vision loaders decode reliably.
+// Everything else — WebP above all (stb_image cannot read it), HEIC/AVIF/TIFF —
+// makes the backend reject the request even though the encoding shape is right.
+// PC uploads are often WebP (images saved from the web) while phone cameras
+// produce JPEG, which is exactly why "it fails on PC but works on mobile".
+const SAFE_IMAGE_MIME = /image\/(jpe?g|png)/i;
+
 /**
- * Fit the image to the vision server's appetite: if the decoded bytes exceed
- * OCR_LLM_MAX_MB, downscale/re-encode with ImageMagick (longest side
- * OCR_LLM_MAX_DIM, JPEG). Without ImageMagick the original is sent unchanged.
+ * Fit the image to the vision server's appetite:
+ *  - any non-JPEG/PNG format is TRANSCODED to JPEG (WebP et al.), and
+ *  - anything over OCR_LLM_MAX_MB is downscaled (longest side OCR_LLM_MAX_DIM),
+ * both via ImageMagick. Without ImageMagick the original is sent unchanged and
+ * the eventual backend error gets a clear install hint appended (see decorate).
  * Cached per image object so multi-pass runs don't re-convert every call.
  */
 const _fitCache = new WeakMap();
 async function fitForModel(image, b64, mime) {
-  if (!LLM_MAX_MB || b64.length * 0.75 <= LLM_MAX_MB * 1024 * 1024) return { b64, mime };
+  const oversize = LLM_MAX_MB > 0 && b64.length * 0.75 > LLM_MAX_MB * 1024 * 1024;
+  const exotic = !SAFE_IMAGE_MIME.test(mime || '');
+  if (!oversize && !exotic) return { b64, mime, exotic, converted: false };
   const key = image && typeof image === 'object' ? image : null;
   if (key && _fitCache.has(key)) return _fitCache.get(key);
-  let out = { b64, mime };
+  let out = { b64, mime, exotic, converted: false };
   try {
     const small = await imageQuality.downscale(Buffer.from(b64, 'base64'), mime, { maxDim: LLM_MAX_DIM });
-    if (small && small.buffer.length < b64.length * 0.75) out = { b64: small.buffer.toString('base64'), mime: small.mime };
+    // Always adopt the JPEG for exotic inputs; for size-only cases adopt it
+    // when it actually shrank the payload.
+    if (small && (exotic || small.buffer.length < b64.length * 0.75)) {
+      out = { b64: small.buffer.toString('base64'), mime: small.mime, exotic, converted: true };
+    }
   } catch { /* best-effort — send the original */ }
   if (key) _fitCache.set(key, out);
   return out;
@@ -443,9 +458,20 @@ async function visionCall(opts) {
 
 async function visionCallInner({ instruction, image, note = '', temperature = TEMPERATURE, maxTokens = MAX_TOKENS, onChunk }) {
   const raw = toImage(image);
-  const { b64, mime } = await fitForModel(image, raw.b64, raw.mime);
+  const fit = await fitForModel(image, raw.b64, raw.mime);
+  const { b64, mime } = fit;
   const stream = typeof onChunk === 'function';
   const url = `${AI_URL}/chat/completions`;
+
+  // When an exotic format (WebP/HEIC/…) could NOT be transcoded because
+  // ImageMagick is missing, tell the user exactly that on failure — the
+  // backend's own error rarely mentions the image format.
+  const decorate = (e) => {
+    if (fit.exotic && !fit.converted) {
+      e.message += ` | NOTE: the uploaded image is ${raw.mime || 'an unknown format'} — many vision backends cannot decode it. Install ImageMagick on the OCR server (sudo apt install imagemagick) so it is converted to JPEG automatically, or upload a JPEG/PNG.`;
+    }
+    return e;
+  };
 
   let fmt = await negotiateFormat();
   for (let attempt = 0; ; attempt++) {
@@ -473,7 +499,7 @@ async function visionCallInner({ instruction, image, note = '', temperature = TE
       return out;
     } catch (e) {
       if (isPayloadError(e.message)) {
-        throw new Error(`the image is too large for the vision server (${Math.round(b64.length * 0.75 / 1024 / 1024 * 10) / 10} MB sent). Install ImageMagick so the server can downscale automatically (OCR_LLM_MAX_MB/OCR_LLM_MAX_DIM), or upload a smaller photo. Server said: ${e.message}`);
+        throw decorate(new Error(`the image is too large for the vision server (${Math.round(b64.length * 0.75 / 1024 / 1024 * 10) / 10} MB sent). Install ImageMagick so the server can downscale automatically (OCR_LLM_MAX_MB/OCR_LLM_MAX_DIM), or upload a smaller photo. Server said: ${e.message}`));
       }
       // The negotiated format stopped working (server restarted with another
       // build?) or the answer came back empty: re-probe once and retry.
@@ -482,7 +508,7 @@ async function visionCallInner({ instruction, image, note = '', temperature = TE
         fmt = await negotiateFormat(true);
         continue;
       }
-      throw e;
+      throw decorate(e);
     }
   }
 }

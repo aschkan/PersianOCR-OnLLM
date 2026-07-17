@@ -15,6 +15,12 @@
 // Hard target for the uploaded image ("maximum image size 1 MB").
 export const MAX_UPLOAD_BYTES = 1024 * 1024;
 
+// Formats the local vision backends (llama.cpp/LM Studio) often CANNOT decode —
+// WebP above all (PC images saved from the web are usually WebP, which is why
+// OCR "worked on mobile but not on PC"). These are ALWAYS re-encoded to JPEG,
+// regardless of size.
+const REENCODE_TYPES = /image\/(webp|heic|heif|tiff?|gif|avif|bmp)/i;
+
 // Re-encode attempts, best quality first. 2000 px longest side is more than
 // enough for receipt OCR; the floor (1000 px / 0.5) still reads fine.
 const LADDER = [
@@ -62,12 +68,17 @@ function render(src, w, h, dim, quality) {
 
 /**
  * maybeCompressImage(file, opts?) → Promise<File>
- * Files at or under `maxBytes` pass through untouched. Bigger ones come back
- * as a JPEG File under the cap (or the smallest achievable). Never throws.
+ * JPEG/PNG at or under `maxBytes` pass through untouched. Bigger files come
+ * back as a JPEG under the cap (or the smallest achievable), and WebP/HEIC/…
+ * are converted to JPEG even when small — the vision backend can't read them.
+ * Never throws.
  */
 export async function maybeCompressImage(file, { maxBytes = MAX_UPLOAD_BYTES } = {}) {
   try {
-    if (!file || !/^image\//.test(file.type) || file.size <= maxBytes) return file;
+    if (!file || !/^image\//.test(file.type)) return file;
+    const tooBig = file.size > maxBytes;
+    const badType = REENCODE_TYPES.test(file.type);
+    if (!tooBig && !badType) return file;
 
     const src = await decode(file);
     const w = src.width || src.naturalWidth;
@@ -82,8 +93,10 @@ export async function maybeCompressImage(file, { maxBytes = MAX_UPLOAD_BYTES } =
     }
     if (src.close) src.close();
 
-    // keep the original only when re-encoding somehow made things worse
-    if (!best || best.size >= file.size) return file;
+    if (!best) return file;
+    // For a decodable-but-oversized JPEG/PNG, keep the original if re-encoding
+    // somehow made it bigger. A bad TYPE must convert no matter what.
+    if (!badType && best.size >= file.size) return file;
 
     const name = (file.name || 'receipt').replace(/\.[^.]*$/, '') + '.jpg';
     return new File([best], name, { type: 'image/jpeg', lastModified: file.lastModified || Date.now() });

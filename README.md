@@ -196,6 +196,14 @@ until it fits), and the server downscales anything still above
 `OCR_LLM_MAX_MB` (default 1 MB) to `OCR_LLM_MAX_DIM` (default 2048 px) with
 ImageMagick before sending it to the vision server.
 
+**WebP/HEIC uploads are converted to JPEG.** llama.cpp/LM Studio vision
+loaders typically cannot decode WebP (or HEIC/AVIF/TIFF) — and images saved
+from the web on a PC are usually WebP, which is why OCR could "work on mobile
+but fail on PC". The browser re-encodes those formats to JPEG before upload
+regardless of size, and the server transcodes any non-JPEG/PNG with
+ImageMagick as the backstop (without ImageMagick the error now names the
+format and the fix instead of failing cryptically).
+
 **Fail fast when LM Studio is unreachable.** Every OCR endpoint now runs a
 4-second reachability preflight first. If the GPU box is off, LM Studio's
 server isn't started, the IP is wrong or a firewall is in the way, the UI

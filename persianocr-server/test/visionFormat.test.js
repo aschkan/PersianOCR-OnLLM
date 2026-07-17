@@ -19,6 +19,7 @@ const RAW_ERR = `'url' field must be a base64 encoded image.`;
 let server, ocr;
 let mode = 'raw-b64-only';   // which image encoding the fake server accepts
 let emptyOnce = false;       // next REAL call answers 200 with empty content
+let decodeFail = false;      // real calls fail like a backend that can't read the image bytes
 const seen = [];             // { probe, kind } per request, in order
 
 // kind of image_url the client sent: 'dataurl-obj' | 'raw-obj' | 'string'
@@ -44,6 +45,7 @@ before(async () => {
       if (kind === 'string') return reject(OBJ_ERR);
       if (mode === 'raw-b64-only' && kind !== 'raw-obj') return reject(kind === 'dataurl-obj' ? RAW_ERR : OBJ_ERR);
       if (mode === 'dataurl-only' && kind !== 'dataurl-obj') return reject(OBJ_ERR);
+      if (!probe && decodeFail) return reject('Failed to process the image: unknown or unsupported format');
 
       let content = 'OK-' + kind;
       if (!probe && emptyOnce) { emptyOnce = false; content = ''; }
@@ -99,6 +101,17 @@ test('payload/context errors are surfaced with guidance, not format-cycled', asy
     (e) => /too large for the vision server/.test(e.message) && /context length/.test(e.message)
   );
   mode = 'dataurl-only';
+});
+
+test('undecodable WebP: failure names the format and the ImageMagick fix', async () => {
+  decodeFail = true;
+  // "UklGR…" — the WebP signature seen in the production LM Studio log.
+  const webp = { buffer: Buffer.from('UklGRfake-webp-bytes'), mime: 'image/webp' };
+  await assert.rejects(
+    () => ocr.visionCall({ instruction: 'x', image: webp }),
+    (e) => /image\/webp/.test(e.message) && /ImageMagick/.test(e.message)
+  );
+  decodeFail = false;
 });
 
 test('classifiers recognise the exact production error strings', () => {
