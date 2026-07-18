@@ -66,6 +66,26 @@ test('digit-run guard: word fixes pass, any number change fails', () => {
   assert.equal(P.sameDigitRuns(main, fixedDroppedLine), false); // numbers dropped → reject
 });
 
+test('transcriptScore: a read whose digits corroborate its words wins', () => {
+  // the real production pair: bad read turned the amount into a "time" and
+  // dropped the payment rows; good read carries ۱۲،۰۰۰،۰۰۰ matching the words
+  const bad = [
+    '۱۷۰ : محسن شمار ه Syl ؟ افز pp',
+    'مبلغ به عدد : ۱۲:۵۰:۰۰ ریال به حروف : دوازده میلیون ریال از آقای/خانم : مشتری اول',
+    'جمع به حروف : دوازده میلیون ریال',
+  ].join('\n');
+  const good = [
+    'شماره : ۱۷۰ نرم افزاری محسن',
+    'مبلغ به عدد : ۱۲،۰۰۰،۰۰۰ ریال به حروف : دوازده میلیون ریال از آقای/خانم : مشتری اول',
+    'چک ۱۲۳۴۵۶ — ۵،۰۰۰،۰۰۰ ریال',
+    'ATM — ۷،۰۰۰،۰۰۰ ریال',
+    'جمع به حروف : دوازده میلیون ریال',
+  ].join('\n');
+  assert.ok(P.transcriptScore(good) > P.transcriptScore(bad) + 1,
+    `good=${P.transcriptScore(good)} must beat bad=${P.transcriptScore(bad)}`);
+  assert.equal(P.transcriptScore(''), -1);
+});
+
 test('collectIdentifiers: labelled numbers are IDs; مبلغ lines are not', () => {
   const text = [
     'شماره چک/نوع : ۱۲۳۴۵۶',

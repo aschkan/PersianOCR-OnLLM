@@ -229,6 +229,38 @@ function sameDigitRuns(a, b) {
   return true;
 }
 
+/**
+ * Deterministic quality score for a receipt transcription — used to pick the
+ * BETTER of two independent reads as the base text (small vision models are a
+ * lottery per run; one read often nails the amounts the other garbles).
+ * Signals, strongest first:
+ *   +8  the amount-in-words («دوازده میلیون ریال») is corroborated by matching
+ *       digits somewhere in the same text — the single best sign of a good read
+ *   +2  an amount-in-words phrase exists at all
+ *   +2/each (cap 6) money-like digit runs (≥6 digits ending in 000)
+ *   +0.5/each (cap 4) receipt keywords (مبلغ/جمع/تاریخ/شماره/ریال/تومان)
+ *   −0.5/each (cap 4) ASCII junk tokens ("Syl", "pp", "Oy" — hallucination noise)
+ *   −0.3/each «؟» uncertainty markers
+ */
+function transcriptScore(text) {
+  if (!text || !String(text).trim()) return -1;
+  const t = normalizeDigits(text);
+  let score = 0;
+  const words = extractAmountInWords(t);
+  const runs = digitRuns(t);
+  if (words && words.value != null) {
+    score += 2;
+    const target = String(words.value);
+    const unseparated = t.replace(/[,،٬]/g, '');
+    if (runs.includes(target) || unseparated.includes(target)) score += 8;
+  }
+  score += Math.min(6, runs.filter((r) => r.length >= 6 && /000$/.test(r)).length * 2);
+  score += Math.min(4, (t.match(/مبلغ|جمع|تاریخ|شماره|ریال|تومان/g) || []).length * 0.5);
+  score -= Math.min(4, (t.match(/[A-Za-z]{2,}/g) || []).length * 0.5);
+  score -= (t.match(/؟/g) || []).length * 0.3;
+  return score;
+}
+
 module.exports = {
   normalizeDigits,
   digitsOnly,
@@ -239,4 +271,5 @@ module.exports = {
   collectIdentifiers,
   digitRuns,
   sameDigitRuns,
+  transcriptScore,
 };

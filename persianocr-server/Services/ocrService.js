@@ -591,16 +591,25 @@ async function transcribeWithSpellfix(image, { note = '', onChunk, onStatus, ref
   } catch { /* no second source → main stands */ }
   if (!second.trim()) { if (onChunk) onChunk(main); return main; }
 
+  // Small models are a per-run lottery: one read may nail the amounts the
+  // other garbles into a "time" or drops entirely. Score both reads
+  // deterministically (amount-in-words corroborated by digits is the key
+  // signal) and make the BETTER one the base whose numbers are protected —
+  // the other becomes the hints. Slight hysteresis favours the first read,
+  // which had reference-OCR grounding.
+  let base = main, hints = second;
+  if (P.transcriptScore(second) > P.transcriptScore(main) + 1) { base = second; hints = main; }
+
   try {
     if (onStatus) onStatus({ phase: 'spellfix' });
-    const fixed = await visionCall({ instruction: spellfixInstruction(main, second), image, note, temperature: 0, onChunk });
-    // Word fixes only: identical numbers, comparable length — else MAIN wins.
-    const lengthSane = fixed.length >= main.length * 0.6 && fixed.length <= main.length * 1.6;
-    if (P.sameDigitRuns(main, fixed) && lengthSane) return fixed;
-    return main;
+    const fixed = await visionCall({ instruction: spellfixInstruction(base, hints), image, note, temperature: 0, onChunk });
+    // Word fixes only: identical numbers, comparable length — else the base wins.
+    const lengthSane = fixed.length >= base.length * 0.6 && fixed.length <= base.length * 1.6;
+    if (P.sameDigitRuns(base, fixed) && lengthSane) return fixed;
+    return base;
   } catch {
-    if (onChunk) onChunk(main);
-    return main;
+    if (onChunk) onChunk(base);
+    return base;
   }
 }
 

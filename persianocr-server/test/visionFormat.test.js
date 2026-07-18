@@ -129,6 +129,19 @@ test('dictation fix: word repairs accepted, digit changes rejected', async () =>
   script = null;
 });
 
+test('best-of-two: a garbled base read is replaced by the better second read', async () => {
+  // today's production failure: base read renders the amount as a TIME and
+  // loses the payment rows — the second read is objectively better and must
+  // become the base whose numbers the guard protects.
+  const BAD_MAIN = 'محسن شمار ه Syl افز pp\nمبلغ به عدد : ۱۲:۵۰:۰۰ ریال به حروف : دوازده میلیون ریال\nجمع به حروف : دوازده میلیون ریال';
+  const GOOD_SECOND = 'نرم افزاری محسن\nمبلغ به عدد : ۱۲،۰۰۰،۰۰۰ ریال به حروف : دوازده میلیون ریال\nچک ۱۲۳۴۵۶ — ۵،۰۰۰،۰۰۰ ریال\nATM — ۷،۰۰۰،۰۰۰ ریال\nجمع به حروف : دوازده میلیون ریال';
+  const FIXED = GOOD_SECOND.replace('نرم افزاری', 'نرم‌افزاری'); // same digits, word touch-up
+
+  script = [BAD_MAIN, GOOD_SECOND, FIXED];
+  assert.equal(await ocr.transcribeRefined(IMAGE), FIXED);
+  script = null;
+});
+
 test('classifiers recognise the exact production error strings', () => {
   assert.equal(ocr.isImageFormatError(OBJ_ERR), true);
   assert.equal(ocr.isImageFormatError(RAW_ERR), true);
