@@ -115,6 +115,71 @@ test('applyFixes: a clean, correct extraction is left untouched', () => {
   assert.equal(warnings.length, 0);
 });
 
+// ── payment-row recovery (empty items + separator mis-grouping) ───────────────
+
+// the production transcription: amounts read as 500,000,000 / 700,000,000
+// (mis-grouped separators), total digits read as 1,000,000, items empty.
+const GARBLED = [
+  'سند دریافت',
+  'مبلغ به عدد : ۱,۰۰۰,۰۰۰ ریال به حروف : دوازده میلیون ریال از آقای/خانم : مشتری اول',
+  'شماره چک/دوع : ۹۸۷۶۵ شماره حساب : ۱,۲۳۴,۵۶۷ مبلغ (ریال) : ۵۰۰,۰۰۰,۰۰۰',
+  'ATM ۹۸۸۸۷۶۵ مبلغ (ریال) : ۷۰۰,۰۰۰,۰۰۰',
+  'جمع به حروف : دوازده میلیون ریال',
+].join('\n');
+
+test('extractRowCandidates: money rows in, identifiers/totals/dates out', () => {
+  const vals = V.extractRowCandidates(SANAD).map((c) => c.value);
+  assert.deepEqual(vals.sort((a, b) => a - b), [5000000, 7000000]);
+  const garbled = V.extractRowCandidates(GARBLED).map((c) => c.value);
+  assert.ok(garbled.includes(500000000) && garbled.includes(700000000));
+  assert.ok(!garbled.includes(98765) && !garbled.includes(9888765));
+});
+
+test('recoverRows: exact sum wins; regrouped separators corrected; ambiguity refused', () => {
+  // clean case: 5M + 7M = 12M
+  const exact = V.recoverRows([{ value: 5000000, label: 'چک' }, { value: 7000000, label: 'ATM' }], 12000000);
+  assert.ok(exact && exact.allExact);
+  assert.deepEqual(exact.rows.map((r) => r.value).sort((a, b) => a - b), [5000000, 7000000]);
+
+  // the production bug: 500,000,000 / 700,000,000 → ÷100 → 5M + 7M = 12M
+  const scaled = V.recoverRows(
+    [{ value: 1234567, label: '' }, { value: 500000000, label: 'چک' }, { value: 700000000, label: 'ATM' }],
+    12000000
+  );
+  assert.ok(scaled && !scaled.allExact);
+  assert.deepEqual(scaled.rows.map((r) => r.value).sort((a, b) => a - b), [5000000, 7000000]);
+
+  // ambiguous: {12M} vs {5M,7M} both sum → refuse... {12M} alone is size 1 so
+  // make it truly ambiguous with two 2-row solutions
+  const ambiguous = V.recoverRows(
+    [{ value: 5000000 }, { value: 7000000 }, { value: 4000000 }, { value: 8000000 }],
+    12000000
+  );
+  assert.equal(ambiguous, null);
+
+  assert.equal(V.recoverRows([{ value: 5000000 }], 12000000), null); // one row is no table
+});
+
+test('verify + applyFixes: production case fully repaired (rows, total, invoice no)', () => {
+  const s = V.coerceStructured({
+    total: 1000000, currency: 'IRR', items: [],
+    amountInWords: 'دوازده میلیون ریال', invoiceNumber: '1405/08/14',
+  });
+  const v = V.verify(s, { transcription: GARBLED });
+  assert.equal(v.checks.wordsMatchDigits, false);
+  assert.ok(v.rowRecovery, 'rows must be recoverable');
+
+  const { data, warnings } = V.applyFixes(s, v);
+  assert.equal(data.total, 12000000);                              // words win
+  assert.deepEqual(data.items.map((it) => it.total).sort((a, b) => a - b), [5000000, 7000000]);
+  assert.equal(data.subtotal, 12000000);
+  assert.equal(data.invoiceNumber, null);                          // date evicted
+  assert.ok(warnings.some((w) => /separator grouping/.test(w)));
+
+  const v2 = V.verify(data, { transcription: GARBLED });
+  assert.equal(V.passed(v2), true);                                // fixed object is clean
+});
+
 test('confidence: full pass ≈ 1, failures drag it down', () => {
   assert.equal(V.confidence({ a: true, b: true, c: null }, 0), 1);
   const low = V.confidence({ a: false, b: false, c: true }, 2);

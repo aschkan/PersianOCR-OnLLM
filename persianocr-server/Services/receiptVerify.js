@@ -49,6 +49,81 @@ function coerceStructured(input) {
   return s;
 }
 
+// ── Payment-row recovery ──────────────────────────────────────────────────────
+// Models routinely return items:[] for tabular receipts, or mis-group the
+// thousands separators (۵٬۰۰۰٬۰۰۰ read as ۵۰۰٬۰۰۰٬۰۰۰). The document itself
+// carries the proof needed to fix both: the row amounts must sum to the
+// amount-in-words. These helpers harvest money-like candidates from the text
+// and search for the UNIQUE combination (each candidate optionally re-grouped
+// by a power of ten) that sums to the words value.
+
+/** Money-like digit runs from table lines (identifiers, dates, totals excluded). */
+function extractRowCandidates(text) {
+  if (!text) return [];
+  const t = P.normalizeDigits(text);
+  const ids = P.collectIdentifiers(t).all;
+  const out = [];
+  for (const line of t.split('\n')) {
+    // total/words lines are not rows
+    if (/به\s*حروف|به\s*عدد|جمع|مبلغ\s*کل|قابل\s*پرداخت/.test(line)) continue;
+    for (const run of line.match(/[0-9][0-9,،٬]*[0-9]/g) || []) {
+      const d = run.replace(/[^0-9]/g, '');
+      if (d.length < 4 || ids.has(d)) continue;
+      const grouped = /[,،٬]/.test(run);
+      if (!grouped && !(d.length >= 6 && /000$/.test(d))) continue; // not money-like
+      const n = Number(d);
+      if (!Number.isSafeInteger(n) || n < 1000) continue;
+      const label = (line.match(/چک|ATM|پوز|POS|کارت|نقد|حواله/) || [])[0] || '';
+      out.push({ value: n, label });
+      if (out.length >= 8) return out;
+    }
+  }
+  return out;
+}
+
+/**
+ * Find the row set summing EXACTLY to `target` (the words value). Each
+ * candidate may be re-scaled by a power of ten (integer results only) to undo
+ * separator mis-grouping. Accepted only when the solution is unambiguous:
+ * exactly one value-set overall, or exactly one using unscaled values.
+ * → { rows:[{value,label,exact}], allExact } or null.
+ */
+function recoverRows(candidates, target) {
+  if (!target || !candidates || candidates.length < 2) return null;
+  const cands = candidates.slice(0, 8);
+  const variantsOf = (v) => {
+    const set = [];
+    for (let k = -6; k <= 3; k++) {
+      const scaled = k >= 0 ? v * 10 ** k : v / 10 ** -k;
+      if (!Number.isSafeInteger(scaled) || scaled < 1000 || scaled > target) continue;
+      set.push({ value: scaled, exact: k === 0 });
+    }
+    return set;
+  };
+  const sols = [];
+  const pick = (i, chosen, sum, allExact) => {
+    if (sum === target && chosen.length >= 2) sols.push({ rows: chosen.slice(), allExact });
+    if (i >= cands.length || sum >= target || chosen.length >= 4 || sols.length > 6) return;
+    pick(i + 1, chosen, sum, allExact); // skip candidate i
+    for (const v of variantsOf(cands[i].value)) {
+      chosen.push({ value: v.value, label: cands[i].label, exact: v.exact });
+      pick(i + 1, chosen, sum + v.value, allExact && v.exact);
+      chosen.pop();
+    }
+  };
+  pick(0, [], 0, true);
+  // different scalings can produce the same value-set — dedupe on the values
+  const uniq = new Map();
+  for (const s of sols) {
+    const k = s.rows.map((r) => r.value).sort((a, b) => a - b).join('+');
+    if (!uniq.has(k) || s.allExact) uniq.set(k, s);
+  }
+  const list = [...uniq.values()];
+  if (list.length === 1) return list[0];
+  const exact = list.filter((s) => s.allExact);
+  return exact.length === 1 ? exact[0] : null;
+}
+
 /** Sum of item line totals, or null when no line has one. */
 function itemsSum(items) {
   let sum = 0, any = false;
@@ -79,7 +154,7 @@ function verify(structured, ctx = {}) {
   const s = structured || {};
   const text = [ctx.transcription || '', ctx.refText || ''].filter(Boolean).join('\n');
   const issues = [];
-  const checks = { wordsMatchDigits: null, currencyFromUnit: null, arithmeticOk: null, noIdAsAmount: null, zerosPlausible: null };
+  const checks = { wordsMatchDigits: null, currencyFromUnit: null, arithmeticOk: null, noIdAsAmount: null, zerosPlausible: null, rowsFound: null };
 
   // ── amount in words: the source of truth for the total ─────────────────────
   const fromText = P.extractAmountInWords(text);
@@ -149,7 +224,26 @@ function verify(structured, ctx = {}) {
     checks.noIdAsAmount = text ? true : null;
   }
 
-  return { checks, issues, wordsValue, wordsPhrase, textCurrency, identifiers };
+  // ── payment rows: empty items on a tabular document ─────────────────────────
+  // If the text shows ≥2 money-like row amounts while items[] is empty, try to
+  // recover the rows deterministically (unique combination summing to the
+  // words value, allowing separator-regrouping). Recovery success is applied
+  // later by applyFixes; only an UNRECOVERABLE mismatch asks the model again.
+  let rowRecovery = null;
+  if (wordsValue != null && items.length === 0) {
+    const candidates = extractRowCandidates(text);
+    if (candidates.length >= 2) {
+      rowRecovery = recoverRows(candidates, wordsValue);
+      if (!rowRecovery) {
+        checks.rowsFound = false;
+        issues.push(`items[] is empty but the document lists row amounts (${candidates.map((c) => c.value).join(', ')}). Re-read the مبلغ (ریال) column of EVERY table row — the rows must sum to ${wordsValue}.`);
+      }
+    }
+  } else if (items.length > 0) {
+    checks.rowsFound = true;
+  }
+
+  return { checks, issues, wordsValue, wordsPhrase, textCurrency, identifiers, rowRecovery };
 }
 
 /** True when no check failed (nulls — untestable — don't count as failures). */
@@ -201,6 +295,24 @@ function applyFixes(structured, v) {
     changed = true;
   }
 
+  // payment rows recovered from the document text (unique sum == words value)
+  if (v.rowRecovery && !(s.items || []).length) {
+    s.items = v.rowRecovery.rows.map((r, i) => ({ name: r.label || `ردیف ${i + 1}`, qty: null, unitPrice: null, total: r.value }));
+    if (s.subtotal == null) s.subtotal = v.rowRecovery.rows.reduce((a, r) => a + r.value, 0);
+    const sum = s.items.map((it) => it.total).join(' + ');
+    warnings.push(v.rowRecovery.allExact
+      ? `payment rows recovered from the document text (${sum} = total)`
+      : `payment rows recovered with separator grouping corrected (${sum} = total)`);
+    changed = true;
+  }
+
+  // a date is never a document number (models love putting تاریخ in شماره)
+  if (s.invoiceNumber && /^\d{2,4}[/.\-]\d{1,2}[/.\-]\d{1,4}$/.test(P.normalizeDigits(s.invoiceNumber))) {
+    warnings.push(`invoiceNumber (${s.invoiceNumber}) looked like a date and was cleared`);
+    s.invoiceNumber = null;
+    changed = true;
+  }
+
   // surface the labelled identifiers we found ourselves (never overwrites model's)
   const slots = { cheque: null, account: null, reference: null, terminal: null, card: null, phone: null, serial: null };
   s.identifiers = Object.assign(slots, v.identifiers.byKey, s.identifiers || {});
@@ -219,4 +331,4 @@ function confidence(checks, warningsCount) {
   return Math.max(0, Math.round((0.4 + 0.6 * ratio - 0.05 * Math.min(warningsCount, 4)) * 100) / 100);
 }
 
-module.exports = { coerceStructured, verify, passed, applyFixes, confidence, itemsSum, powerOfTenApart, MONEY_FIELDS };
+module.exports = { coerceStructured, verify, passed, applyFixes, confidence, itemsSum, powerOfTenApart, extractRowCandidates, recoverRows, MONEY_FIELDS };

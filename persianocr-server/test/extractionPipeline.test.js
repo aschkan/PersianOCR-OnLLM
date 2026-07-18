@@ -110,6 +110,31 @@ test('model never yields: deterministic fixes still deliver the right answer', a
   }
 });
 
+test('production case: mis-grouped rows + empty items + wrong total, all repaired', async () => {
+  // What the server actually saw: separators mis-grouped the row amounts into
+  // 500,000,000 / 700,000,000, the total digits came out as 1,000,000, the
+  // model returned no items and put a date in invoiceNumber.
+  const GARBLED = [
+    'سند دریافت',
+    'مبلغ به عدد : ۱,۰۰۰,۰۰۰ ریال به حروف : دوازده میلیون ریال از آقای/خانم : مشتری اول',
+    'شماره چک/دوع : ۹۸۷۶۵ شماره حساب : ۱,۲۳۴,۵۶۷ مبلغ (ریال) : ۵۰۰,۰۰۰,۰۰۰',
+    'ATM ۹۸۸۸۷۶۵ مبلغ (ریال) : ۷۰۰,۰۰۰,۰۰۰',
+    'جمع به حروف : دوازده میلیون ریال',
+  ].join('\n');
+  const stubborn = { total: 1000000, currency: 'IRR', items: [], amountInWords: 'دوازده میلیون ریال', invoiceNumber: '1405/08/14' };
+
+  const { pipeline } = fakePipeline([stubborn]);
+  const { data, verification } = await pipeline.extract(IMAGE, { transcription: GARBLED });
+  assert.equal(data.total, 12000000);                                  // words win over 1,000,000
+  assert.deepEqual(data.items.map((it) => it.total).sort((a, b) => a - b), [5000000, 7000000]);
+  assert.equal(data.subtotal, 12000000);
+  assert.equal(data.invoiceNumber, null);                              // the date is gone
+  assert.ok(verification.warnings.some((w) => /separator grouping/.test(w)));
+  for (const [name, val] of Object.entries(verification.checks)) {
+    assert.notEqual(val, false, `check ${name} must not fail after fixes`);
+  }
+});
+
 test('invalid JSON first, valid on repair', async () => {
   const { pipeline, calls } = fakePipeline(['sorry, no JSON here', { total: 12000000, currency: 'IRR', items: [] }]);
   const { data } = await pipeline.extract(IMAGE, { transcription: TRANSCRIPTION });
