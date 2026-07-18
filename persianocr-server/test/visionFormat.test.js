@@ -20,6 +20,7 @@ let server, ocr;
 let mode = 'raw-b64-only';   // which image encoding the fake server accepts
 let emptyOnce = false;       // next REAL call answers 200 with empty content
 let decodeFail = false;      // real calls fail like a backend that can't read the image bytes
+let script = null;           // scripted reply contents (one per call), for flow tests
 const seen = [];             // { probe, kind } per request, in order
 
 // kind of image_url the client sent: 'dataurl-obj' | 'raw-obj' | 'string'
@@ -47,7 +48,7 @@ before(async () => {
       if (mode === 'dataurl-only' && kind !== 'dataurl-obj') return reject(OBJ_ERR);
       if (!probe && decodeFail) return reject('Failed to process the image: unknown or unsupported format');
 
-      let content = 'OK-' + kind;
+      let content = script && script.length ? script.shift() : 'OK-' + kind;
       if (!probe && emptyOnce) { emptyOnce = false; content = ''; }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
@@ -112,6 +113,20 @@ test('undecodable WebP: failure names the format and the ImageMagick fix', async
     (e) => /image\/webp/.test(e.message) && /ImageMagick/.test(e.message)
   );
   decodeFail = false;
+});
+
+test('dictation fix: word repairs accepted, digit changes rejected', async () => {
+  const MAIN = 'عبلغ به عحد : ۱۲،۰۰۰،۰۰۰ ریال به حروف : دوازده میلیون ریال';
+  const SECOND = 'مبلغ به عدد : 12,000,000 ریال به حروف : دوازده میلیون ریال';
+  const GOOD = 'مبلغ به عدد : ۱۲،۰۰۰،۰۰۰ ریال به حروف : دوازده میلیون ریال';
+  const BAD = 'مبلغ به عدد : ۱۲۰،۰۰۰،۰۰۰ ریال به حروف : دوازده میلیون ریال';
+
+  script = [MAIN, SECOND, GOOD];               // main read → second read → fix
+  assert.equal(await ocr.transcribeRefined(IMAGE), GOOD);
+
+  script = [MAIN, SECOND, BAD];                // fix added a zero → MAIN wins
+  assert.equal(await ocr.transcribeRefined(IMAGE), MAIN);
+  script = null;
 });
 
 test('classifiers recognise the exact production error strings', () => {

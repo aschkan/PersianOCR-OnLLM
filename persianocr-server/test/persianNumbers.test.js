@@ -54,6 +54,18 @@ test('detectCurrency: only the printed unit decides, never size or habit', () =>
   assert.equal(P.detectCurrency('هیچ واحدی چاپ نشده'), null);
 });
 
+test('digit-run guard: word fixes pass, any number change fails', () => {
+  // the real garbled example: words wrong, numbers right
+  const main = 'عبلغ به عحد : ۱۲،۰۰۰،۰۰۰ ریال به حروف : دوازده میلیون ریال\nترم اقزارهای مختلق شخصی مالی\nتاریخ ۱۳۹۵/۰۸/۱۳';
+  const fixedWords = 'مبلغ به عدد : ۱۲،۰۰۰،۰۰۰ ریال به حروف : دوازده میلیون ریال\nنرم افزارهای مختلف شخصی مالی\nتاریخ ۱۳۹۵/۰۸/۱۳';
+  const fixedExtraZero = main.replace('۱۲،۰۰۰،۰۰۰', '۱۲۰،۰۰۰،۰۰۰');
+  const fixedDroppedLine = 'مبلغ به عدد : ۱۲،۰۰۰،۰۰۰ ریال';
+  assert.deepEqual(P.digitRuns('۱۲،۰۰۰،۰۰۰ ریال'), ['12', '000', '000']);
+  assert.equal(P.sameDigitRuns(main, fixedWords), true);       // dictation fix OK
+  assert.equal(P.sameDigitRuns(main, fixedExtraZero), false);  // digit changed → reject
+  assert.equal(P.sameDigitRuns(main, fixedDroppedLine), false); // numbers dropped → reject
+});
+
 test('collectIdentifiers: labelled numbers are IDs; مبلغ lines are not', () => {
   const text = [
     'شماره چک/نوع : ۱۲۳۴۵۶',

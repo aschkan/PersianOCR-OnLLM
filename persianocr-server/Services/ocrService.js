@@ -19,6 +19,7 @@ const http = require('http');
 const https = require('https');
 const textOcr = require('./textOcr');   // optional Tesseract grounding (digits)
 const imageQuality = require('./imageQuality');           // per-image quality probe + enhance/crop
+const P = require('./persianNumbers');                    // digit-run guard for the dictation fix
 const { createPipeline } = require('./extractionPipeline'); // adaptive self-verifying extraction
 
 // ── Config (env → built-in defaults) ──────────────────────────────────────────
@@ -80,10 +81,17 @@ const LLM_MAX_DIM = Number(process.env.OCR_LLM_MAX_DIM) || 2048;
 const OCR_PASSES = Math.max(1, Math.min(6, Number(process.env.OCR_PASSES) || 1));
 const OCR_DRAFT_TEMP = process.env.OCR_DRAFT_TEMP !== undefined ? Number(process.env.OCR_DRAFT_TEMP) : 0.35;
 
+// Dictation repair (default ON): after the main transcription, read the image
+// a SECOND time independently, then ask the model to fix ONLY the garbled
+// Persian words of the main text (numbers/structure untouchable), using the
+// second reading + the image as evidence. A deterministic digit-run guard
+// rejects the result if any number changed. Costs two extra model calls.
+const SPELLFIX = !/^(0|false|no|off)$/i.test(process.env.OCR_SPELLFIX ?? 'true');
+
 function getConfig() {
   return {
     url: AI_URL, model: AI_MODEL, hasKey: !!AI_KEY, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS,
-    temperature: TEMPERATURE, imageMode: _negotiated || _fmtId || 'auto', passes: OCR_PASSES,
+    temperature: TEMPERATURE, imageMode: _negotiated || _fmtId || 'auto', passes: OCR_PASSES, spellfix: SPELLFIX,
     llmImageGuard: { maxMb: LLM_MAX_MB, maxDim: LLM_MAX_DIM },
     tesseract: textOcr.status(), imageTools: imageQuality.status(), pipeline: pipeline.config,
   };
@@ -197,6 +205,31 @@ const RECONCILE_PROMPT = [
   '- Render tables as GitHub-flavoured Markdown with the original headers.',
   '- Output only the final transcription — no commentary, no notes, no code fences.',
 ].join('\n');
+
+// Dictation repair: fix ONLY the garbled Persian words of the MAIN transcription,
+// with a second independent reading as hints and the image as ground truth.
+// Numbers and structure are explicitly untouchable (and enforced by a
+// deterministic digit-run guard after the call).
+function spellfixInstruction(main, second) {
+  return [
+    'You are a Persian (Farsi) OCR proof-reader. The receipt image is attached — it is the ground truth.',
+    'Below is the MAIN transcription of this image. It has the right structure and the right NUMBERS, but some Persian words are misspelled/garbled (e.g. «عبلغ به عحد» should be «مبلغ به عدد», «ترم اقزارهای مختلق» should be «نرم افزارهای مختلف»).',
+    'A SECOND independent reading of the same image follows — use it ONLY as a hint for what a garbled word should have been.',
+    '',
+    'Rewrite the MAIN transcription with ONLY these corrections:',
+    '- Fix misspelled or garbled Persian words so they read as printed on the image.',
+    '- DO NOT change ANY digit or number: every amount, date, time, code and phone number must stay EXACTLY as in the MAIN text (same digits, same separators).',
+    '- DO NOT add anything that is not in the MAIN text. DO NOT drop lines. DO NOT reorder or restructure. Keep the line breaks as they are.',
+    '- If you are not sure what a word should be, keep the MAIN text version unchanged.',
+    '- Output ONLY the corrected text — no commentary, no code fences.',
+    '',
+    '--- MAIN TRANSCRIPTION ---',
+    main,
+    '--- SECOND READING (hints only) ---',
+    second,
+    '--- END ---',
+  ].join('\n');
+}
 
 // Structured extraction → strict JSON. Kept separate so each call is one focused
 // task, which a 4B model handles far more reliably than a combined mega-prompt.
@@ -538,6 +571,40 @@ async function transcribe(image, { note = '', onChunk, ref } = {}) {
 }
 
 /**
+ * The dictation-repair transcription (default single-pass flow):
+ *   1. MAIN read of the image (this text's numbers/structure are authoritative);
+ *   2. SECOND independent read (step A — evidence for what garbled words meant);
+ *   3. fix pass (streamed): rewrite MAIN fixing only misspelled Persian words.
+ * A deterministic guard then verifies the fix changed NO digit run and kept a
+ * sane length — otherwise the MAIN text wins. Every failure path falls back to
+ * MAIN, so this can only ever improve on the old single-pass behaviour.
+ */
+async function transcribeWithSpellfix(image, { note = '', onChunk, onStatus, ref = '' } = {}) {
+  if (onStatus) onStatus({ phase: 'main-read' });
+  const main = await visionCall({ instruction: withReference(TRANSCRIBE_PROMPT, ref), image, note });
+
+  let second = '';
+  try {
+    if (onStatus) onStatus({ phase: 'second-read' });
+    // a touch of temperature so the second read fails differently than the first
+    second = await visionCall({ instruction: TRANSCRIBE_PROMPT, image, note, temperature: OCR_DRAFT_TEMP });
+  } catch { /* no second source → main stands */ }
+  if (!second.trim()) { if (onChunk) onChunk(main); return main; }
+
+  try {
+    if (onStatus) onStatus({ phase: 'spellfix' });
+    const fixed = await visionCall({ instruction: spellfixInstruction(main, second), image, note, temperature: 0, onChunk });
+    // Word fixes only: identical numbers, comparable length — else MAIN wins.
+    const lengthSane = fixed.length >= main.length * 0.6 && fixed.length <= main.length * 1.6;
+    if (P.sameDigitRuns(main, fixed) && lengthSane) return fixed;
+    return main;
+  } catch {
+    if (onChunk) onChunk(main);
+    return main;
+  }
+}
+
+/**
  * Higher-accuracy transcription: run several independent passes, then reconcile
  * them against the image in a final proof-reading pass (streamed if onChunk).
  * `passes` defaults to OCR_PASSES; 1 falls straight through to transcribe().
@@ -565,7 +632,10 @@ async function transcribeRefined(image, { note = '', passes = OCR_PASSES, onChun
 
   // Reference OCR once, reused across every pass (grounds digits everywhere).
   const ref = useRef ? await referenceOcr(image) : '';
-  if (passes <= 1) return transcribe(image, { note, onChunk, ref });
+  if (passes <= 1) {
+    if (!SPELLFIX) return transcribe(image, { note, onChunk, ref });
+    return transcribeWithSpellfix(image, { note, onChunk, onStatus, ref });
+  }
 
   const draftInstruction = withReference(TRANSCRIBE_PROMPT, ref);
   // 1) draft passes (non-streaming, a little temperature for useful diversity).

@@ -208,6 +208,27 @@ function collectIdentifiers(text) {
   return { byKey, all };
 }
 
+// ── Transcript-fix safety (the dictation-repair pass must not touch numbers) ──
+/** Every digit run in the text, normalized to ASCII, in order. */
+function digitRuns(text) {
+  const t = normalizeDigits(text || '');
+  return t.match(/[0-9]+/g) || [];
+}
+
+/**
+ * True when two texts carry EXACTLY the same numbers (as a multiset of digit
+ * runs — order-insensitive, separators ignored). Used to accept/reject the
+ * dictation-fix pass: word fixes are welcome, any changed/added/dropped digit
+ * means the "fix" is discarded and the original transcription kept.
+ */
+function sameDigitRuns(a, b) {
+  const ra = digitRuns(a).sort();
+  const rb = digitRuns(b).sort();
+  if (ra.length !== rb.length) return false;
+  for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return false;
+  return true;
+}
+
 module.exports = {
   normalizeDigits,
   digitsOnly,
@@ -216,4 +237,6 @@ module.exports = {
   extractAmountInWords,
   detectCurrency,
   collectIdentifiers,
+  digitRuns,
+  sameDigitRuns,
 };

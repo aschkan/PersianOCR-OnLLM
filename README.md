@@ -146,6 +146,17 @@ Small vision models misread dense receipts — especially large Persian amounts
 Both combine, and both are just env settings (`OCR_TESSERACT`, `OCR_PASSES`). For
 raw recognition of unusual fonts, also try a bigger model (`OCR_AI_MODEL`).
 
+### Dictation repair (default on)
+
+Single-pass transcriptions read the numbers right but often garble Persian
+words («عبلغ به عحد» for «مبلغ به عدد»). With `OCR_SPELLFIX=true` (default) the
+server reads the image a **second** time independently, then runs a fix pass:
+rewrite the main transcription correcting **only** misspelled words, using the
+second reading and the image as evidence — never touching numbers, lines or
+structure. A deterministic digit-run guard then compares the numbers in both
+texts; if even one digit changed, the fix is discarded and the original kept.
+Costs two extra model calls; `OCR_SPELLFIX=false` restores the single call.
+
 ### Adaptive self-verifying extraction
 
 Structured extraction (`POST /api/receipts/:id/structure`) no longer trusts the
