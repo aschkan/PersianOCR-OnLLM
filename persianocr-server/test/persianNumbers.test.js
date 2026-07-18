@@ -86,6 +86,19 @@ test('transcriptScore: a read whose digits corroborate its words wins', () => {
   assert.equal(P.transcriptScore(''), -1);
 });
 
+test('scrubNoise: junk Latin clumps and lone «؟» go, digits and ATM stay', () => {
+  // the exact junk header from production (contains invisible LRM marks)
+  const junk = '۱۷۰ : محسن شمار ه‎ Syl ؟ افز‎ pp';
+  const clean = P.scrubNoise(junk);
+  assert.ok(!/Syl|pp|؟/.test(clean), clean);
+  assert.deepEqual(P.digitRuns(clean), P.digitRuns(junk));      // digits untouched
+  assert.equal(clean, '۱۷۰ : محسن شمار ه افز');
+
+  const atm = 'ATM — ۷،۰۰۰،۰۰۰ ریال';
+  assert.equal(P.scrubNoise(atm), atm);                          // whitelisted token survives
+  assert.equal(P.scrubNoise('Total: 12 USD lines only'), 'Total: 12 USD lines only'); // Latin-only line untouched
+});
+
 test('collectIdentifiers: labelled numbers are IDs; مبلغ lines are not', () => {
   const text = [
     'شماره چک/نوع : ۱۲۳۴۵۶',

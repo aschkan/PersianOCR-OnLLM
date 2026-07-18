@@ -229,6 +229,35 @@ function sameDigitRuns(a, b) {
   return true;
 }
 
+// Short Latin tokens that legitimately appear on Iranian receipts and must
+// survive the noise scrub.
+const ASCII_KEEP = new Set(['ATM', 'POS', 'PIN', 'IR', 'IRR', 'IRT', 'RRN', 'REF', 'VAT']);
+
+/**
+ * Remove OCR noise a small vision model sprinkles into Persian receipts —
+ * WITHOUT touching a single digit:
+ *  - invisible direction marks (U+200E/U+200F) that glue junk into words;
+ *  - meaningless short Latin clumps inside Persian lines («Syl», «pp», «Oy») —
+ *    known receipt tokens (ATM, POS, …) survive;
+ *  - standalone «؟» uncertainty markers (attached ones stay);
+ *  - doubled spaces / spaces before punctuation left behind by the removals.
+ */
+function scrubNoise(text) {
+  if (!text) return text;
+  return String(text)
+    .replace(/[‎‏]/g, '')
+    .split('\n')
+    .map((line) => {
+      if (!/[؀-ۿ]/.test(line)) return line;   // pure-Latin lines stay
+      let l = line;
+      l = l.replace(/(^|\s)([A-Za-z]{1,4})(?=\s|$)/g, (m, pre, tok) => (ASCII_KEEP.has(tok.toUpperCase()) ? m : pre));
+      l = l.replace(/(^|\s)[؟?](?=\s|$)/g, '$1');
+      l = l.replace(/\s{2,}/g, ' ').replace(/\s+([:،؛])/g, ' $1').trimEnd();
+      return l;
+    })
+    .join('\n');
+}
+
 /**
  * Deterministic quality score for a receipt transcription — used to pick the
  * BETTER of two independent reads as the base text (small vision models are a
@@ -272,4 +301,5 @@ module.exports = {
   digitRuns,
   sameDigitRuns,
   transcriptScore,
+  scrubNoise,
 };

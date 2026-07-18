@@ -218,6 +218,7 @@ function spellfixInstruction(main, second) {
     '',
     'Rewrite the MAIN transcription with ONLY these corrections:',
     '- Fix misspelled or garbled Persian words so they read as printed on the image.',
+    '- DELETE meaningless junk fragments that correspond to NOTHING on the image — stray Latin clumps ("Syl", "pp", "Oy"), lone «؟» marks, broken half-words. Never delete real words, numbers, or whole lines.',
     '- DO NOT change ANY digit or number: every amount, date, time, code and phone number must stay EXACTLY as in the MAIN text (same digits, same separators).',
     '- DO NOT add anything that is not in the MAIN text. DO NOT drop lines. DO NOT reorder or restructure. Keep the line breaks as they are.',
     '- If you are not sure what a word should be, keep the MAIN text version unchanged.',
@@ -589,7 +590,7 @@ async function transcribeWithSpellfix(image, { note = '', onChunk, onStatus, ref
     // a touch of temperature so the second read fails differently than the first
     second = await visionCall({ instruction: TRANSCRIBE_PROMPT, image, note, temperature: OCR_DRAFT_TEMP });
   } catch { /* no second source → main stands */ }
-  if (!second.trim()) { if (onChunk) onChunk(main); return main; }
+  if (!second.trim()) { const out = P.scrubNoise(main); if (onChunk) onChunk(out); return out; }
 
   // Small models are a per-run lottery: one read may nail the amounts the
   // other garbles into a "time" or drops entirely. Score both reads
@@ -603,13 +604,16 @@ async function transcribeWithSpellfix(image, { note = '', onChunk, onStatus, ref
   try {
     if (onStatus) onStatus({ phase: 'spellfix' });
     const fixed = await visionCall({ instruction: spellfixInstruction(base, hints), image, note, temperature: 0, onChunk });
-    // Word fixes only: identical numbers, comparable length — else the base wins.
-    const lengthSane = fixed.length >= base.length * 0.6 && fixed.length <= base.length * 1.6;
-    if (P.sameDigitRuns(base, fixed) && lengthSane) return fixed;
-    return base;
+    // Word fixes only: identical numbers, comparable length — else the base
+    // wins. Either way the deterministic noise scrub runs last (it never
+    // touches digits, so the guard's verdict stands).
+    const lengthSane = fixed.length >= base.length * 0.55 && fixed.length <= base.length * 1.6;
+    if (P.sameDigitRuns(base, fixed) && lengthSane) return P.scrubNoise(fixed);
+    return P.scrubNoise(base);
   } catch {
-    if (onChunk) onChunk(base);
-    return base;
+    const out = P.scrubNoise(base);
+    if (onChunk) onChunk(out);
+    return out;
   }
 }
 
@@ -673,7 +677,8 @@ async function transcribeRefined(image, { note = '', passes = OCR_PASSES, onChun
   if (onStatus) onStatus({ phase: 'reconcile', of: passes });
   const attempts = drafts.map((d, i) => `### Attempt ${i + 1}\n${d}`).join('\n\n');
   const instruction = withReference(`${RECONCILE_PROMPT}\n\n--- OCR ATTEMPTS ---\n${attempts}`, ref);
-  return visionCall({ instruction, image, note, temperature: 0, onChunk });
+  const reconciled = await visionCall({ instruction, image, note, temperature: 0, onChunk });
+  return P.scrubNoise(reconciled);
 }
 
 /**
