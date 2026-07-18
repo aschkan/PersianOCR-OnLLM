@@ -1,6 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { Copy, Check, Download, Pencil, Save, X, FileJson, Braces, Code2, RefreshCw, Eye, Maximize2 } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Copy, Check, Download, Pencil, Save, X, FileJson, Code2, RefreshCw, Eye } from 'lucide-react';
 import { useT } from '../i18n/LangContext';
 import { api, copyText } from '../api/client';
 import { InlineSpinner } from './ui';
@@ -9,13 +8,15 @@ import StructuredView from './StructuredView';
 
 /**
  * ResultPanel — the OCR output surface. Shows the transcription (formatted or
- * raw), copy/download/edit actions, structured (JSON) extraction, and re-run.
+ * raw) with copy/download/edit actions, and runs the structured (JSON)
+ * extraction AUTOMATICALLY once the text is in — no separate button. A 2-step
+ * progress bar tells the user the invoice data is still coming (1/2 → 2/2).
  * Used both live on the Home page (while streaming) and on the detail page.
  */
 export default function ResultPanel({
   text, streaming = false, receiptId = null,
   structured = null, structuring = false, onStructured, onSaveText, onReprocess,
-  showOpenDetail = false, onToast,
+  onToast,
 }) {
   const { T } = useT();
   const [raw, setRaw] = useState(false);
@@ -23,8 +24,11 @@ export default function ResultPanel({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text || '');
   const [busy, setBusy] = useState('');
+  const autoRef = useRef(''); // receipt id whose auto-extraction already ran
 
   useEffect(() => { if (!editing) setDraft(text || ''); }, [text, editing]);
+
+  const extracting = structuring || busy === 'extract';
 
   const doCopy = async () => {
     if (await copyText(text)) { setCopied(true); setTimeout(() => setCopied(false), 1600); onToast && onToast(T.copied); }
@@ -38,10 +42,25 @@ export default function ResultPanel({
     finally { setBusy(''); }
   };
 
+  // Structured extraction runs by itself as soon as the transcription is done —
+  // one automatic attempt per receipt (re-armed by a re-run; retry stays manual).
+  useEffect(() => {
+    if (streaming || !text || !receiptId || structured || extracting) return;
+    if (autoRef.current === receiptId) return;
+    autoRef.current = receiptId;
+    doExtract();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streaming, text, receiptId, structured]);
+
   const doReprocess = async () => {
     if (!onReprocess) return;
     setBusy('reprocess');
-    try { await onReprocess(); } catch (e) { onToast && onToast(e.message); } finally { setBusy(''); }
+    try {
+      onStructured && onStructured(null);  // stale invoice data goes away…
+      await onReprocess();
+      autoRef.current = '';                // …and re-extracts from the new text
+    } catch (e) { onToast && onToast(e.message); }
+    finally { setBusy(''); }
   };
 
   const saveEdit = async () => {
@@ -50,6 +69,9 @@ export default function ResultPanel({
     catch (e) { onToast && onToast(e.message); }
     finally { setBusy(''); }
   };
+
+  // 2-step progress: streaming text = step 1 running; extraction = step 2.
+  const showBar = streaming || extracting || busy === 'reprocess';
 
   return (
     <div className="card glass">
@@ -68,6 +90,15 @@ export default function ResultPanel({
         ) : null}
       </div>
 
+      {showBar && (
+        <div style={{ margin: '0 0 .9rem' }}>
+          <div className="progressbar"><i style={{ width: streaming || busy === 'reprocess' ? '20%' : '60%' }} /></div>
+          <div className="small muted" style={{ marginTop: '.3rem' }}>
+            {streaming || busy === 'reprocess' ? T.progStep1 : T.progStep2}
+          </div>
+        </div>
+      )}
+
       {/* transcription body */}
       {editing ? (
         <textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={16} style={{ fontFamily: 'monospace' }} />
@@ -77,7 +108,7 @@ export default function ResultPanel({
         <div className="empty">{streaming ? T.processing : T.waiting}</div>
       )}
 
-      {/* actions */}
+      {/* actions — one JSON button (the download); extraction is automatic */}
       {!streaming && text && (
         <div className="row" style={{ marginTop: '1rem', gap: '.4rem' }}>
           {onSaveText && !editing && <button className="ghost small" onClick={() => setEditing(true)}><Pencil size={15} /> {T.edit}</button>}
@@ -90,27 +121,29 @@ export default function ResultPanel({
 
           {receiptId && !editing && (
             <>
-              <button className="ghost small" onClick={doExtract} disabled={busy === 'extract'}>
-                {busy === 'extract' ? <InlineSpinner /> : <Braces size={15} />} {busy === 'extract' ? T.extracting : T.extract}
-              </button>
               <a className="btn ghost small" href={api.exportUrl(receiptId, 'txt')}><Download size={15} /> {T.download} TXT</a>
               <a className="btn ghost small" href={api.exportUrl(receiptId, 'md')}><Download size={15} /> MD</a>
               <a className="btn ghost small" href={api.exportUrl(receiptId, 'json')}><FileJson size={15} /> JSON</a>
               {onReprocess && <button className="ghost small" onClick={doReprocess} disabled={busy === 'reprocess'}>{busy === 'reprocess' ? <InlineSpinner /> : <RefreshCw size={15} />} {T.reprocess}</button>}
-              {showOpenDetail && <Link className="btn small" to={`/receipt/${receiptId}`}><Maximize2 size={15} /> {T.openDetail}</Link>}
             </>
           )}
         </div>
       )}
 
-      {/* structured extraction (auto-run after transcription; nicer table) */}
-      {(structured || structuring) && (
+      {/* structured invoice data (runs automatically; retry only on failure) */}
+      {receiptId && !streaming && text && (
         <div style={{ marginTop: '1.25rem', borderTop: '1px solid rgb(var(--line))', paddingTop: '1rem' }}>
           <div className="row" style={{ marginBottom: '.4rem' }}>
             <h3 style={{ margin: 0 }}>{T.structuredTitle}</h3>
-            {structuring && <span className="tag proc"><InlineSpinner /> {T.extracting}</span>}
+            {extracting
+              ? <span className="tag proc"><InlineSpinner /> {T.extracting}</span>
+              : structured ? <span className="tag ok">{T.progDone}</span> : null}
           </div>
-          {structured ? <StructuredView data={structured} /> : <div className="muted small">{T.extracting}</div>}
+          {structured
+            ? <StructuredView data={structured} />
+            : extracting
+              ? <div className="muted small">{T.extracting}</div>
+              : <button className="ghost small" onClick={doExtract}><RefreshCw size={15} /> {T.retry}</button>}
         </div>
       )}
     </div>
